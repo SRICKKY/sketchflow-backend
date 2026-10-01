@@ -1,7 +1,9 @@
 mod auth;
+mod billing;
 mod config;
 mod db;
 mod error;
+mod extract;
 mod models;
 mod openapi;
 mod routes;
@@ -74,6 +76,8 @@ async fn main() {
         .route("/api/auth/login", post(routes::auth::login))
         .route("/api/auth/logout", post(routes::auth::logout))
         .route("/api/auth/session", get(routes::auth::get_session))
+        .route("/api/create-order", post(routes::billing::create_order))
+        .route("/api/verify-payment", post(routes::billing::verify_payment))
         .merge(openapi::swagger_ui())
         .layer(cors)
         .layer(TraceLayer::new_for_http())

@@ -48,12 +48,12 @@ impl AppConfig {
             razorpay_key_secret: env::var("RAZORPAY_KEY_SECRET")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            plan_price_month_minor: env_var("PLAN_PRICE_MONTH_MINOR", "49900")
+            plan_price_month_minor: env_var("PLAN_PRICE_MONTH_MINOR", "50000")
                 .parse()
-                .unwrap_or(49900),
-            plan_price_year_minor: env_var("PLAN_PRICE_YEAR_MINOR", "499900")
+                .unwrap_or(50000),
+            plan_price_year_minor: env_var("PLAN_PRICE_YEAR_MINOR", "500000")
                 .parse()
-                .unwrap_or(499900),
+                .unwrap_or(500000),
             checkout_currency: env_var("CHECKOUT_CURRENCY", "INR"),
             public_base_url: env_var("PUBLIC_BASE_URL", "http://localhost:8080"),
         }

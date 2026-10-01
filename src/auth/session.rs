@@ -16,7 +16,11 @@ fn is_https(url: &str) -> bool {
 
 /// Sets the signed-session cookie on the response after a successful
 /// register/login.
-pub fn set_session_cookie(cookies: &Cookies, state: &AppState, user_id: &str) -> Result<(), AppError> {
+pub fn set_session_cookie(
+    cookies: &Cookies,
+    state: &AppState,
+    user_id: &str,
+) -> Result<(), AppError> {
     let token = jwt::issue_token(
         user_id,
         &state.config.jwt_secret,

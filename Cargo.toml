@@ -38,6 +38,8 @@ hmac = "0.13"
 sha2 = "0.11"
 rand = "0.10"
 base64 = "0.23"
+hex = "0.4"
+subtle = "2"
 
 # IDs / time
 cuid2 = "0.1"

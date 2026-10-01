@@ -24,6 +24,10 @@ pub enum AppError {
     TooManyRequests(String),
     #[error("{0}")]
     ServiceUnavailable(String),
+    /// Arbitrary upstream-gateway failure (e.g. Razorpay), carrying through
+    /// whatever HTTP status the caller decided best represents it.
+    #[error("{1}")]
+    Gateway(u16, String),
     #[error("internal server error")]
     Internal(#[from] anyhow::Error),
 }
@@ -43,6 +47,10 @@ impl AppError {
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             AppError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
             AppError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
+            AppError::Gateway(status, msg) => (
+                StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY),
+                msg.clone(),
+            ),
             AppError::Internal(err) => {
                 tracing::error!(error = %err, "internal server error");
                 (

@@ -5,6 +5,7 @@ use tower_cookies::Cookies;
 use crate::{
     auth::{password, session},
     error::{AppError, AppResult},
+    extract::AppJson,
     models::{PublicUser, User},
     state::AppState,
 };
@@ -45,7 +46,9 @@ fn normalize_email(email: &str) -> String {
 
 fn validate_credentials(email: &str, password: &str) -> AppResult<()> {
     if email.is_empty() || !email.contains('@') {
-        return Err(AppError::BadRequest("Enter a valid email address.".to_string()));
+        return Err(AppError::BadRequest(
+            "Enter a valid email address.".to_string(),
+        ));
     }
     if password.len() < 8 {
         return Err(AppError::BadRequest(
@@ -70,7 +73,7 @@ fn validate_credentials(email: &str, password: &str) -> AppResult<()> {
 pub async fn register(
     State(state): State<AppState>,
     cookies: Cookies,
-    Json(body): Json<RegisterRequest>,
+    AppJson(body): AppJson<RegisterRequest>,
 ) -> AppResult<Json<AuthResponse>> {
     let email = normalize_email(&body.email);
     validate_credentials(&email, &body.password)?;
@@ -87,7 +90,11 @@ pub async fn register(
 
     let password_hash = password::hash_password(&body.password)?;
     let id = cuid2::create_id();
-    let name = body.name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     let user = sqlx::query_as::<_, User>(
         r#"
@@ -105,9 +112,7 @@ pub async fn register(
 
     session::set_session_cookie(&cookies, &state, &user.id)?;
 
-    Ok(Json(AuthResponse {
-        user: user.into(),
-    }))
+    Ok(Json(AuthResponse { user: user.into() }))
 }
 
 /// Sign in with email + password.
@@ -124,7 +129,7 @@ pub async fn register(
 pub async fn login(
     State(state): State<AppState>,
     cookies: Cookies,
-    Json(body): Json<LoginRequest>,
+    AppJson(body): AppJson<LoginRequest>,
 ) -> AppResult<Json<AuthResponse>> {
     let email = normalize_email(&body.email);
     let invalid = || AppError::Unauthorized("Invalid email or password.".to_string());
@@ -144,9 +149,7 @@ pub async fn login(
 
     session::set_session_cookie(&cookies, &state, &user.id)?;
 
-    Ok(Json(AuthResponse {
-        user: user.into(),
-    }))
+    Ok(Json(AuthResponse { user: user.into() }))
 }
 
 /// Sign out and clear the session cookie.
