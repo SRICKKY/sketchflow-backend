@@ -43,6 +43,7 @@ subtle = "2"
 
 # IDs / time
 cuid2 = "0.1"
+nanoid = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 

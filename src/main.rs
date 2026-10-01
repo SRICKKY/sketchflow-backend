@@ -1,3 +1,4 @@
+mod assets;
 mod auth;
 mod billing;
 mod config;
@@ -6,6 +7,7 @@ mod error;
 mod extract;
 mod models;
 mod openapi;
+mod profile;
 mod routes;
 mod state;
 
@@ -78,6 +80,10 @@ async fn main() {
         .route("/api/auth/session", get(routes::auth::get_session))
         .route("/api/create-order", post(routes::billing::create_order))
         .route("/api/verify-payment", post(routes::billing::verify_payment))
+        .route(
+            "/api/profile/avatar",
+            post(routes::profile::upload_avatar).delete(routes::profile::delete_avatar),
+        )
         .merge(openapi::swagger_ui())
         .layer(cors)
         .layer(TraceLayer::new_for_http())
