@@ -87,6 +87,10 @@ async fn main() {
         )
         .route("/api/uploads", post(routes::uploads::upload_image))
         .route("/api/uploads/{asset_id}", get(routes::uploads::get_asset))
+        .route(
+            "/billing/{invoice_id}/pdf",
+            get(routes::invoices::download_invoice_pdf),
+        )
         .merge(openapi::swagger_ui())
         .layer(cors)
         .layer(TraceLayer::new_for_http())

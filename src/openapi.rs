@@ -1,7 +1,7 @@
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::routes::{auth, billing, health, profile, uploads};
+use crate::routes::{auth, billing, health, invoices, profile, uploads};
 
 /// Aggregated OpenAPI document for the SketchFlow backend. Each module's
 /// handlers are annotated with `#[utoipa::path(...)]` and registered here so
@@ -33,7 +33,8 @@ use crate::routes::{auth, billing, health, profile, uploads};
         profile::upload_avatar,
         profile::delete_avatar,
         uploads::upload_image,
-        uploads::get_asset
+        uploads::get_asset,
+        invoices::download_invoice_pdf
     ),
     components(schemas(
         health::HealthResponse,

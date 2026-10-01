@@ -3,6 +3,7 @@ use sqlx::PgPool;
 
 use crate::{config::AppConfig, error::AppError};
 
+pub mod invoice_pdf;
 pub mod limits;
 pub mod razorpay;
 
@@ -453,4 +454,42 @@ pub async fn activate_pro_subscription(
         interval,
         expires_at,
     })
+}
+
+/// A single invoice row, scoped to the user that owns it. Mirrors `InvoiceRecord`
+/// from `server/billing.ts`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct InvoiceRecord {
+    pub id: String,
+    pub number: String,
+    pub interval: String,
+    pub amount_minor: i32,
+    pub currency: String,
+    pub status: String,
+    pub paid_at: Option<DateTime<Utc>>,
+    pub period_start: Option<DateTime<Utc>>,
+    pub period_end: Option<DateTime<Utc>>,
+    pub gateway_order_id: Option<String>,
+    pub gateway_payment_id: Option<String>,
+}
+
+/// Fetch an invoice by id, scoped to the requesting user. Mirrors
+/// `getInvoiceForUser` from `server/billing.ts`.
+pub async fn get_invoice_for_user(
+    db: &PgPool,
+    user_id: &str,
+    invoice_id: &str,
+) -> Result<Option<InvoiceRecord>, AppError> {
+    let invoice = sqlx::query_as::<_, InvoiceRecord>(
+        r#"SELECT id, number, interval, amount_minor, currency, status, paid_at,
+                  period_start, period_end, gateway_order_id, gateway_payment_id
+           FROM invoices
+           WHERE id = $1 AND user_id = $2"#,
+    )
+    .bind(invoice_id)
+    .bind(user_id)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(invoice)
 }
