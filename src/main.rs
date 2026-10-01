@@ -1,5 +1,6 @@
 mod assets;
 mod auth;
+mod authz;
 mod billing;
 mod config;
 mod db;
@@ -84,6 +85,8 @@ async fn main() {
             "/api/profile/avatar",
             post(routes::profile::upload_avatar).delete(routes::profile::delete_avatar),
         )
+        .route("/api/uploads", post(routes::uploads::upload_image))
+        .route("/api/uploads/{asset_id}", get(routes::uploads::get_asset))
         .merge(openapi::swagger_ui())
         .layer(cors)
         .layer(TraceLayer::new_for_http())

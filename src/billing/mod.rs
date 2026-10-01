@@ -3,6 +3,7 @@ use sqlx::PgPool;
 
 use crate::{config::AppConfig, error::AppError};
 
+pub mod limits;
 pub mod razorpay;
 
 pub const RAZORPAY_MIN_AMOUNT: i64 = 100;
