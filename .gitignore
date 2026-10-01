@@ -1,0 +1,5 @@
+/target
+.env
+*.pdf
+/uploads/
+.DS_Store

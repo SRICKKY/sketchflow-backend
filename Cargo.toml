@@ -1,0 +1,60 @@
+[package]
+name = "sketchflow-backend"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Web framework
+axum = { version = "0.8", features = ["json", "multipart", "macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["cors", "trace", "limit", "fs"] }
+tower-cookies = "0.11"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Database
+sqlx = { version = "0.8", features = [
+  "runtime-tokio-rustls",
+  "postgres",
+  "chrono",
+  "uuid",
+  "json",
+  "migrate",
+] }
+
+# OpenAPI / Swagger
+utoipa = { version = "6", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-swagger-ui = { version = "10", features = ["axum"] }
+utoipa-axum = "0.3"
+
+# Auth
+jsonwebtoken = "11"
+argon2 = "0.6"
+hmac = "0.13"
+sha2 = "0.11"
+rand = "0.10"
+base64 = "0.23"
+
+# IDs / time
+cuid2 = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# HTTP client (Razorpay)
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+
+# PDF generation (invoices)
+printpdf = "0.12"
+
+# Misc
+mime_guess = "2"
+thiserror = "2"
+anyhow = "1"
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+validator = { version = "0.21", features = ["derive"] }
