@@ -1,6 +1,8 @@
 mod config;
 mod db;
 mod error;
+mod openapi;
+mod routes;
 mod state;
 
 use std::sync::Arc;
@@ -61,7 +63,8 @@ async fn main() {
         ]);
 
     let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
+        .route("/health", get(routes::health::health))
+        .merge(openapi::swagger_ui())
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
