@@ -32,7 +32,7 @@ utoipa-swagger-ui = { version = "10", features = ["axum"] }
 utoipa-axum = "0.3"
 
 # Auth
-jsonwebtoken = "11"
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
 argon2 = "0.6"
 hmac = "0.13"
 sha2 = "0.11"

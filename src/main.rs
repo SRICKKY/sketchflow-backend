@@ -1,13 +1,19 @@
+mod auth;
 mod config;
 mod db;
 mod error;
+mod models;
 mod openapi;
 mod routes;
 mod state;
 
 use std::sync::Arc;
 
-use axum::{routing::get, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
+use tower_cookies::CookieManagerLayer;
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
@@ -64,9 +70,14 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(routes::health::health))
+        .route("/api/auth/register", post(routes::auth::register))
+        .route("/api/auth/login", post(routes::auth::login))
+        .route("/api/auth/logout", post(routes::auth::logout))
+        .route("/api/auth/session", get(routes::auth::get_session))
         .merge(openapi::swagger_ui())
         .layer(cors)
         .layer(TraceLayer::new_for_http())
+        .layer(CookieManagerLayer::new())
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr)
