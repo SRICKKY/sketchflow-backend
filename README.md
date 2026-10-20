@@ -13,7 +13,7 @@ documentation.
   schema for the models this API owns
 - **utoipa** + **utoipa-swagger-ui** — OpenAPI spec generation and Swagger UI
 - **jsonwebtoken** + **argon2** — session cookies (JWT) and password hashing
-- **reqwest** — Razorpay HTTP client
+- **reqwest** — Razorpay and Paddle HTTP clients
 - **printpdf** — invoice PDF generation
 
 ## Getting started
@@ -46,10 +46,30 @@ The server listens on `http://localhost:8080` by default.
 | Area | Routes |
 |---|---|
 | Auth | `POST /api/auth/register`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/session` |
-| Billing | `POST /api/create-order`, `POST /api/verify-payment` |
+| Billing | `POST /api/create-order`, `POST /api/verify-payment`, `POST /api/paddle/verify-payment`, `POST /api/paddle/webhook` |
 | Profile | `POST /api/profile/avatar`, `DELETE /api/profile/avatar` |
 | Uploads | `POST /api/uploads`, `GET /api/uploads/{assetId}` |
 | Invoices | `GET /billing/{invoiceId}/pdf` |
+
+`POST /api/create-order` uses `PAYMENT_GATEWAY` (`razorpay` by default, or
+`paddle`). Razorpay keeps the existing order/verification flow. Paddle returns
+`transactionId`, `clientToken`, and `environment`; the frontend confirms the
+checkout with Paddle, then calls `/api/paddle/verify-payment`. Configure the
+Paddle environment, API key, client token, webhook secret, and one-time USD
+price IDs with `PADDLE_*` variables. Paddle's monthly/yearly USD prices must
+match the INR plan amounts converted to USD cents, as done by the SketchFlow
+checkout.
+
+Cashfree payment endpoints are intentionally not implemented in this backend.
+The app's Auth.js provider/callback endpoints are likewise not replicated;
+this service exposes its own register, login, logout, and session routes.
+
+### Endpoint gaps addressed
+
+Compared with the app's payment routes, the backend now supports Paddle
+transaction creation through `POST /api/create-order`, transaction verification
+through `POST /api/paddle/verify-payment`, and signed completion webhooks through
+`POST /api/paddle/webhook`. Cashfree routes remain intentionally excluded.
 
 ## Development
 

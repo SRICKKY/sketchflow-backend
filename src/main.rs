@@ -82,6 +82,11 @@ async fn main() {
         .route("/api/create-order", post(routes::billing::create_order))
         .route("/api/verify-payment", post(routes::billing::verify_payment))
         .route(
+            "/api/paddle/verify-payment",
+            post(routes::billing::verify_paddle_payment),
+        )
+        .route("/api/paddle/webhook", post(routes::billing::paddle_webhook))
+        .route(
             "/api/profile/avatar",
             post(routes::profile::upload_avatar).delete(routes::profile::delete_avatar),
         )

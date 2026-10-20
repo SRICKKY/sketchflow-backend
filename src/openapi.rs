@@ -17,7 +17,7 @@ use crate::routes::{auth, billing, health, invoices, profile, uploads};
     tags(
         (name = "health", description = "Service health"),
         (name = "auth", description = "Authentication and session management"),
-        (name = "billing", description = "Razorpay checkout and subscription activation"),
+        (name = "billing", description = "Razorpay and Paddle checkout, webhooks, and subscription activation"),
         (name = "profile", description = "User profile and avatar management"),
         (name = "uploads", description = "Board image asset uploads"),
         (name = "invoices", description = "Invoice retrieval and PDF export")
@@ -30,6 +30,8 @@ use crate::routes::{auth, billing, health, invoices, profile, uploads};
         auth::get_session,
         billing::create_order,
         billing::verify_payment,
+        billing::verify_paddle_payment,
+        billing::paddle_webhook,
         profile::upload_avatar,
         profile::delete_avatar,
         uploads::upload_image,
@@ -47,6 +49,10 @@ use crate::routes::{auth, billing, health, invoices, profile, uploads};
         billing::CreateOrderResponse,
         billing::VerifyPaymentRequest,
         billing::VerifyPaymentResponse,
+        billing::PaddleVerifyPaymentRequest,
+        billing::PaddleWebhookResponse,
+        crate::billing::paddle::PaddleCheckout,
+        crate::billing::paddle::PaddleCompletion,
         profile::AvatarResponse,
         uploads::UploadResponse,
         crate::models::PublicUser

@@ -5,6 +5,7 @@ use crate::{config::AppConfig, error::AppError};
 
 pub mod invoice_pdf;
 pub mod limits;
+pub mod paddle;
 pub mod razorpay;
 
 pub const RAZORPAY_MIN_AMOUNT: i64 = 100;

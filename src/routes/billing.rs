@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
-use axum::{extract::State, Json};
+use axum::{body::Bytes, extract::State, http::HeaderMap, Json};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tower_cookies::Cookies;
 
 use crate::{
@@ -25,13 +26,24 @@ pub struct CreateOrderRequest {
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct CreateOrderResponse {
-    pub id: String,
-    pub amount: i64,
-    pub currency: String,
-    pub key: String,
+    pub gateway: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(rename = "transactionId", skip_serializing_if = "Option::is_none")]
+    pub transaction_id: Option<String>,
+    #[serde(rename = "clientToken", skip_serializing_if = "Option::is_none")]
+    pub client_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
 }
 
-/// Create a Razorpay order to upgrade the signed-in user to Pro.
+/// Create a payment checkout for the signed-in user to upgrade to Pro.
 #[utoipa::path(
     post,
     path = "/api/create-order",
@@ -73,6 +85,34 @@ pub async fn create_order(
         ));
     }
 
+    if state.config.payment_gateway == "paddle" {
+        let switching_from_monthly = interval == BillingInterval::Year
+            && billing_state.interval == Some(BillingInterval::Month);
+        let checkout = billing::paddle::create_transaction(
+            &state.config,
+            quote.amount_minor,
+            quote.interval,
+            &user.id,
+            switching_from_monthly,
+        )
+        .await?;
+        return Ok(Json(CreateOrderResponse {
+            gateway: "paddle".to_string(),
+            id: None,
+            amount: None,
+            currency: None,
+            key: None,
+            transaction_id: Some(checkout.transaction_id),
+            client_token: Some(checkout.client_token),
+            environment: Some(checkout.environment),
+        }));
+    }
+    if state.config.payment_gateway != "razorpay" {
+        return Err(AppError::ServiceUnavailable(format!(
+            "Unsupported payment gateway '{}'.",
+            state.config.payment_gateway
+        )));
+    }
     if quote.amount_minor < billing::RAZORPAY_MIN_AMOUNT {
         return Err(AppError::BadRequest(
             "Amount must be at least 100 (smallest currency unit).".to_string(),
@@ -115,10 +155,14 @@ pub async fn create_order(
     .await?;
 
     Ok(Json(CreateOrderResponse {
-        id: order.id,
-        amount: order.amount,
-        currency: order.currency,
-        key,
+        gateway: "razorpay".to_string(),
+        id: Some(order.id),
+        amount: Some(order.amount),
+        currency: Some(order.currency),
+        key: Some(key),
+        transaction_id: None,
+        client_token: None,
+        environment: None,
     }))
 }
 
@@ -161,6 +205,105 @@ pub struct VerifyPaymentResponse {
     pub interval: String,
     #[serde(rename = "expiresAt")]
     pub expires_at: String,
+}
+
+#[derive(Debug, Default, Deserialize, utoipa::ToSchema)]
+pub struct PaddleVerifyPaymentRequest {
+    #[serde(rename = "transactionId")]
+    pub transaction_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct PaddleWebhookResponse {
+    pub received: bool,
+}
+
+/// Verify a completed Paddle transaction and activate the Pro subscription.
+#[utoipa::path(
+    post,
+    path = "/api/paddle/verify-payment",
+    tag = "billing",
+    request_body = PaddleVerifyPaymentRequest,
+    responses(
+        (status = 200, description = "Payment verified and plan activated", body = billing::paddle::PaddleCompletion),
+        (status = 400, description = "Invalid transaction or payment state"),
+        (status = 401, description = "Not signed in"),
+        (status = 403, description = "Payment belongs to a different user")
+    )
+)]
+pub async fn verify_paddle_payment(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    AppJson(body): AppJson<PaddleVerifyPaymentRequest>,
+) -> AppResult<Json<billing::paddle::PaddleCompletion>> {
+    let user = session::optional_current_user(&cookies, &state)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("Sign in to verify payment.".to_string()))?;
+    let transaction_id = body
+        .transaction_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| AppError::BadRequest("transactionId is required.".to_string()))?;
+
+    let completion = billing::paddle::complete_transaction(
+        &state.db,
+        &state.config,
+        transaction_id,
+        Some(&user.id),
+    )
+    .await?;
+    Ok(Json(completion))
+}
+
+/// Receive Paddle transaction events after validating the signature over the raw body.
+#[utoipa::path(
+    post,
+    path = "/api/paddle/webhook",
+    tag = "billing",
+    params(
+        ("Paddle-Signature" = String, Header, description = "Paddle webhook signature")
+    ),
+    request_body(content = String, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Webhook acknowledged", body = PaddleWebhookResponse),
+        (status = 400, description = "Invalid webhook payload"),
+        (status = 403, description = "Invalid webhook signature"),
+        (status = 503, description = "Webhook secret not configured")
+    )
+)]
+pub async fn paddle_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    raw_body: Bytes,
+) -> AppResult<Json<PaddleWebhookResponse>> {
+    let signature = headers
+        .get("Paddle-Signature")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| AppError::BadRequest("Paddle-Signature header is required.".into()))?;
+    let secret = billing::paddle::webhook_secret(&state.config)?;
+    if !billing::paddle::webhook_signature_matches(&raw_body, signature, secret) {
+        return Err(AppError::Forbidden(
+            "Invalid Paddle webhook signature.".to_string(),
+        ));
+    }
+
+    let event: Value = serde_json::from_slice(&raw_body)
+        .map_err(|_| AppError::BadRequest("Paddle webhook payload is invalid.".into()))?;
+    if event.get("event_type").and_then(Value::as_str) == Some("transaction.completed") {
+        let transaction_id = event
+            .get("data")
+            .and_then(|data| data.get("id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| {
+                AppError::BadRequest("Paddle webhook transaction ID is missing.".into())
+            })?;
+        billing::paddle::complete_transaction(&state.db, &state.config, transaction_id, None)
+            .await?;
+    }
+
+    Ok(Json(PaddleWebhookResponse { received: true }))
 }
 
 /// Verify a Razorpay payment signature and activate the Pro subscription.
