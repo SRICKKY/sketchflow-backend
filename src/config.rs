@@ -11,8 +11,15 @@ pub struct AppConfig {
     pub jwt_session_days: i64,
     pub cors_allowed_origins: Vec<String>,
     pub asset_storage_dir: String,
+    pub payment_gateway: String,
     pub razorpay_key_id: Option<String>,
     pub razorpay_key_secret: Option<String>,
+    pub paddle_environment: String,
+    pub paddle_api_key: Option<String>,
+    pub paddle_client_token: Option<String>,
+    pub paddle_webhook_secret: Option<String>,
+    pub paddle_price_id_monthly: Option<String>,
+    pub paddle_price_id_yearly: Option<String>,
     pub plan_price_month_minor: i64,
     pub plan_price_year_minor: i64,
     pub checkout_currency: String,
@@ -44,8 +51,25 @@ impl AppConfig {
             jwt_session_days: env_var("JWT_SESSION_DAYS", "30").parse().unwrap_or(30),
             cors_allowed_origins,
             asset_storage_dir: env_var("ASSET_STORAGE_DIR", "./uploads"),
+            payment_gateway: env_var("PAYMENT_GATEWAY", "razorpay")
+                .trim()
+                .to_ascii_lowercase(),
             razorpay_key_id: env::var("RAZORPAY_KEY_ID").ok().filter(|s| !s.is_empty()),
             razorpay_key_secret: env::var("RAZORPAY_KEY_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            paddle_environment: env_var("PADDLE_ENV", "sandbox").trim().to_ascii_lowercase(),
+            paddle_api_key: env::var("PADDLE_API_KEY").ok().filter(|s| !s.is_empty()),
+            paddle_client_token: env::var("PADDLE_CLIENT_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            paddle_webhook_secret: env::var("PADDLE_WEBHOOK_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            paddle_price_id_monthly: env::var("PADDLE_PRICE_ID_MONTHLY")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            paddle_price_id_yearly: env::var("PADDLE_PRICE_ID_YEARLY")
                 .ok()
                 .filter(|s| !s.is_empty()),
             plan_price_month_minor: env_var("PLAN_PRICE_MONTH_MINOR", "50000")
