@@ -130,9 +130,8 @@ CREATE TABLE board_elements (
 CREATE INDEX board_elements_board_id_created_at_idx ON board_elements (board_id, created_at);
 CREATE INDEX board_elements_board_id_type_idx ON board_elements (board_id, type);
 
--- Uploaded binary assets (avatars, pasted board images). The Next.js app
--- stores these via `@/lib/storage`; this backend persists metadata here and
--- the bytes on disk under `ASSET_STORAGE_DIR`.
+-- Uploaded binary assets (avatars, pasted board images). This backend
+-- persists metadata here and stores bytes in S3 or under ASSET_STORAGE_DIR.
 CREATE TABLE assets (
     id            TEXT PRIMARY KEY,
     mime_type     TEXT NOT NULL,

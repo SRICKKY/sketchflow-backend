@@ -100,15 +100,7 @@ pub async fn upload_avatar(
         return Err(AppError::TooManyRequests(message));
     }
 
-    let asset = assets::save_asset(
-        &state.db,
-        &state.config.asset_storage_dir,
-        &buffer,
-        &mime_type,
-        256,
-        256,
-    )
-    .await?;
+    let asset = assets::save_asset(&state.db, &state.config, &buffer, &mime_type, 256, 256).await?;
     let image = assets::asset_url(&asset.id);
 
     let same_month = quota.avatar_change_month.as_deref() == Some(month.as_str());

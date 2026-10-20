@@ -11,6 +11,11 @@ pub struct AppConfig {
     pub jwt_session_days: i64,
     pub cors_allowed_origins: Vec<String>,
     pub asset_storage_dir: String,
+    pub s3_bucket: Option<String>,
+    pub s3_region: Option<String>,
+    pub s3_access_key_id: Option<String>,
+    pub s3_secret_access_key: Option<String>,
+    pub s3_session_token: Option<String>,
     pub payment_gateway: String,
     pub razorpay_key_id: Option<String>,
     pub razorpay_key_secret: Option<String>,
@@ -28,6 +33,17 @@ pub struct AppConfig {
 
 fn env_var(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+fn env_option(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn preferred_env(primary: &str, fallback: &str) -> Option<String> {
+    env_option(primary).or_else(|| env_option(fallback))
 }
 
 impl AppConfig {
@@ -51,6 +67,12 @@ impl AppConfig {
             jwt_session_days: env_var("JWT_SESSION_DAYS", "30").parse().unwrap_or(30),
             cors_allowed_origins,
             asset_storage_dir: env_var("ASSET_STORAGE_DIR", "./uploads"),
+            s3_bucket: env_option("S3_BUCKET"),
+            s3_region: preferred_env("S3_REGION", "AWS_REGION")
+                .or_else(|| env_option("AWS_DEFAULT_REGION")),
+            s3_access_key_id: preferred_env("S3_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"),
+            s3_secret_access_key: preferred_env("S3_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"),
+            s3_session_token: preferred_env("S3_SESSION_TOKEN", "AWS_SESSION_TOKEN"),
             payment_gateway: env_var("PAYMENT_GATEWAY", "razorpay")
                 .trim()
                 .to_ascii_lowercase(),
