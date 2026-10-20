@@ -146,7 +146,7 @@ pub async fn upload_image(
 
     let asset = assets::save_asset(
         &state.db,
-        &state.config.asset_storage_dir,
+        &state.config,
         &buffer,
         &mime_type,
         width.filter(|w| *w > 0).unwrap_or(800),
@@ -178,7 +178,7 @@ pub async fn get_asset(
     State(state): State<AppState>,
     Path(asset_id): Path<String>,
 ) -> AppResult<Response> {
-    let asset = assets::read_asset(&state.db, &asset_id)
+    let asset = assets::read_asset(&state.db, &state.config, &asset_id)
         .await?
         .ok_or_else(|| AppError::NotFound("Not found".to_string()))?;
 

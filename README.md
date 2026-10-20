@@ -14,6 +14,7 @@ documentation.
 - **utoipa** + **utoipa-swagger-ui** — OpenAPI spec generation and Swagger UI
 - **jsonwebtoken** + **argon2** — session cookies (JWT) and password hashing
 - **reqwest** — Razorpay and Paddle HTTP clients
+- **aws-sdk-s3** — optional image and avatar storage in Amazon S3
 - **printpdf** — invoice PDF generation
 
 ## Getting started
@@ -50,6 +51,14 @@ The server listens on `http://localhost:8080` by default.
 | Profile | `POST /api/profile/avatar`, `DELETE /api/profile/avatar` |
 | Uploads | `POST /api/uploads`, `GET /api/uploads/{assetId}` |
 | Invoices | `GET /billing/{invoiceId}/pdf` |
+
+Image and avatar uploads use S3 when `S3_BUCKET` is configured. Set `S3_REGION`
+and optionally `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, and
+`S3_SESSION_TOKEN`; the backend also supports AWS environment credentials and
+the standard AWS credential provider chain (including IAM roles). Without
+`S3_BUCKET`, uploads continue to use local `ASSET_STORAGE_DIR`. S3 uploads
+store image objects under `assets/` plus JSON metadata sidecars, and the
+existing `GET /api/uploads/{assetId}` endpoint streams the image from S3.
 
 `POST /api/create-order` uses `PAYMENT_GATEWAY` (`razorpay` by default, or
 `paddle`). Razorpay keeps the existing order/verification flow. Paddle returns
