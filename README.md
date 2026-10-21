@@ -88,3 +88,33 @@ cargo test
 cargo fmt
 cargo clippy
 ```
+
+### Build a Linux deployment artifact
+
+The **Build Linux release** GitHub Actions workflow builds the release
+executable on Ubuntu 22.04 for x86_64. It runs for pull requests and pushes to
+`main`, and can also be started manually from the repository's Actions tab. A
+successful run publishes the `sketchflow-backend-linux-x86_64` artifact for 14
+days.
+
+Download and extract the artifact, then copy the executable to the EC2
+instance. For example, from the machine where the artifact was downloaded:
+
+```bash
+scp -i /path/to/key.pem sketchflow-backend \
+  ubuntu@YOUR_EC2_IP:~/sketchflow-backend/sketchflow-backend
+```
+
+On EC2, run the executable from the backend directory so it can read the
+instance's existing `.env` file:
+
+```bash
+cd ~/sketchflow-backend
+chmod +x ./sketchflow-backend
+./sketchflow-backend
+```
+
+This artifact is for x86_64 Linux instances, such as the EC2 T3 family. Check
+the instance architecture with `uname -m` before deployment. Keep runtime
+secrets in the EC2 environment; the build workflow does not require or upload
+the `.env` file. Deploy artifacts only from trusted workflow runs.
