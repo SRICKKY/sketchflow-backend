@@ -48,9 +48,17 @@ async fn main() {
         .await
         .expect("failed to run database migrations");
 
+    let collaboration = match config.redis_url.as_deref() {
+        Some(redis_url) => routes::collaboration::CollaborationHub::with_redis(redis_url)
+            .await
+            .unwrap_or_else(|_| panic!("failed to initialize Redis collaboration pub/sub")),
+        None => routes::collaboration::CollaborationHub::default(),
+    };
+
     let state = AppState {
         db: pool,
         config: Arc::new(config.clone()),
+        collaboration,
     };
 
     let origins: Vec<_> = config
@@ -92,6 +100,14 @@ async fn main() {
         )
         .route("/api/uploads", post(routes::uploads::upload_image))
         .route("/api/uploads/{asset_id}", get(routes::uploads::get_asset))
+        .route(
+            "/api/boards/{board_id}/collaboration",
+            get(routes::collaboration::websocket),
+        )
+        .route(
+            "/api/boards/{board_id}/snapshot",
+            get(routes::collaboration::snapshot),
+        )
         .route(
             "/billing/{invoice_id}/pdf",
             get(routes::invoices::download_invoice_pdf),

@@ -11,6 +11,8 @@ documentation.
 - **axum** — HTTP server/routing
 - **sqlx** (Postgres) — database access, schema mirrors the SketchFlow Prisma
   schema for the models this API owns
+- **Redis** — optional shared Pub/Sub fan-out for collaboration across
+  backend instances
 - **utoipa** + **utoipa-swagger-ui** — OpenAPI spec generation and Swagger UI
 - **jsonwebtoken** + **argon2** — session cookies (JWT) and password hashing
 - **reqwest** — Razorpay and Paddle HTTP clients
@@ -22,6 +24,7 @@ documentation.
 ```bash
 cp .env.example .env
 # edit .env with your Postgres URL, JWT secret, Razorpay keys, etc.
+# set REDIS_URL to enable cross-instance collaboration fan-out
 
 # start Postgres (example using Docker)
 docker run --name sketchflow-db -e POSTGRES_USER=sketchflow \
@@ -50,7 +53,68 @@ The server listens on `http://localhost:8080` by default.
 | Billing | `POST /api/create-order`, `POST /api/verify-payment`, `POST /api/paddle/verify-payment`, `POST /api/paddle/webhook` |
 | Profile | `POST /api/profile/avatar`, `DELETE /api/profile/avatar` |
 | Uploads | `POST /api/uploads`, `GET /api/uploads/{assetId}` |
+| Collaboration | `GET /api/boards/{boardId}/snapshot`, `GET /api/boards/{boardId}/collaboration` (WebSocket) |
 | Invoices | `GET /billing/{invoiceId}/pdf` |
+
+The collaboration WebSocket requires the existing `sketchflow_session` cookie
+and an `Origin` listed in `CORS_ALLOWED_ORIGINS`. It sends an initial
+`connected` event and a revisioned `snapshot`. All JSON messages have
+`protocolVersion: 1`. Clients submit
+`{"type":"apply_operation","protocolVersion":1,"clientOperationId":"...","batch":{"upserts":[...],"deletedIds":[]}}`
+messages; the backend validates and atomically persists each operation,
+assigns its board revision, and broadcasts `operation_applied` to the board.
+Retries with the same actor and operation ID are idempotent while the
+operation remains in the latest 1,000-operation history for that board. A
+client can send `presence` messages containing a cursor and selected element
+IDs; those events are transient and are never stored.
+
+The WebSocket message shapes are:
+
+| Direction | `type` | Fields |
+|---|---|---|
+| Server | `connected` | `boardId`, `connectionId`, `role` |
+| Server | `snapshot` | `boardId`, `revision`, `elements` |
+| Client | `apply_operation` | `clientOperationId`, `batch: { upserts, deletedIds }` |
+| Server | `operation_applied` | `revision`, `clientOperationId`, `actorId`, `batch` |
+| Client | `presence` | optional `cursor: { x, y }`, `selectedIds` |
+| Server | `presence_joined` | `connectionId`, `userId`, `name`, `image` |
+| Server | `presence_updated` | `connectionId`, `userId`, `cursor`, `selectedIds` |
+| Server | `presence_left` | `connectionId`, `userId` |
+| Client | `ping` | no additional fields |
+| Server | `pong` | no additional fields |
+| Server | `error` | `message` |
+| Server | `resync_required` | reconnect and fetch a fresh snapshot |
+
+All client messages include `protocolVersion: 1`. For example:
+
+```json
+{
+  "type": "presence",
+  "protocolVersion": 1,
+  "cursor": { "x": 120, "y": 80 },
+  "selectedIds": ["element-id"]
+}
+```
+Connections are limited to 60 JSON messages per second and 1 MiB per message;
+board access is periodically revalidated while the socket remains open.
+
+Owners and editors can submit document changes. Viewers can receive snapshots
+and presence but cannot edit. Simultaneous edits are ordered by the backend;
+the last accepted update to a given element wins.
+
+Set `REDIS_URL` to a Redis connection URL to enable shared Pub/Sub fan-out;
+`rediss://` URLs use TLS. All backend instances must use the same Redis service
+and channel. When Redis is unset, collaboration uses in-process fan-out and
+requires a single backend instance. Redis Pub/Sub is transient rather than
+durable: Postgres remains authoritative, and clients must honor
+`resync_required` or a revision gap by fetching a fresh snapshot. Redis is
+required at startup when `REDIS_URL` is configured; subscriber connections
+retry after runtime disconnections.
+
+Canvas edits made through the existing Next.js server actions do not produce
+collaboration operations. Enable collaborative editing only after clients
+write through this backend, or after all legacy write paths have been updated
+to participate in its revision and broadcast flow.
 
 Image and avatar uploads use S3 when `S3_BUCKET` is configured. Set `S3_REGION`
 and optionally `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, and

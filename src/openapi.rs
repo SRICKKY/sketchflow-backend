@@ -1,7 +1,7 @@
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::routes::{auth, billing, health, invoices, profile, uploads};
+use crate::routes::{auth, billing, collaboration, health, invoices, profile, uploads};
 
 /// Aggregated OpenAPI document for the SketchFlow backend. Each module's
 /// handlers are annotated with `#[utoipa::path(...)]` and registered here so
@@ -11,7 +11,7 @@ use crate::routes::{auth, billing, health, invoices, profile, uploads};
     info(
         title = "SketchFlow API",
         version = "0.1.0",
-        description = "REST API for SketchFlow: auth, billing, profile, board uploads and invoices.",
+        description = "REST API for SketchFlow: auth, billing, profile, board collaboration, uploads and invoices.",
         license(name = "UNLICENSED")
     ),
     tags(
@@ -20,6 +20,7 @@ use crate::routes::{auth, billing, health, invoices, profile, uploads};
         (name = "billing", description = "Razorpay and Paddle checkout, webhooks, and subscription activation"),
         (name = "profile", description = "User profile and avatar management"),
         (name = "uploads", description = "Board image asset uploads"),
+        (name = "collaboration", description = "Board snapshots and live collaboration"),
         (name = "invoices", description = "Invoice retrieval and PDF export")
     ),
     paths(
@@ -36,6 +37,7 @@ use crate::routes::{auth, billing, health, invoices, profile, uploads};
         profile::delete_avatar,
         uploads::upload_image,
         uploads::get_asset,
+        collaboration::snapshot,
         invoices::download_invoice_pdf
     ),
     components(schemas(
@@ -55,6 +57,7 @@ use crate::routes::{auth, billing, health, invoices, profile, uploads};
         crate::billing::paddle::PaddleCompletion,
         profile::AvatarResponse,
         uploads::UploadResponse,
+        collaboration::SnapshotResponse,
         crate::models::PublicUser
     ))
 )]

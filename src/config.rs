@@ -7,6 +7,7 @@ pub struct AppConfig {
     pub host: String,
     pub port: u16,
     pub database_url: String,
+    pub redis_url: Option<String>,
     pub jwt_secret: String,
     pub jwt_session_days: i64,
     pub cors_allowed_origins: Vec<String>,
@@ -63,6 +64,7 @@ impl AppConfig {
             port: env_var("PORT", "8080").parse().unwrap_or(8080),
             database_url: env::var("DATABASE_URL")
                 .expect("DATABASE_URL must be set (see .env.example)"),
+            redis_url: env_option("REDIS_URL"),
             jwt_secret: env_var("JWT_SECRET", "change-me-dev-secret"),
             jwt_session_days: env_var("JWT_SESSION_DAYS", "30").parse().unwrap_or(30),
             cors_allowed_origins,
