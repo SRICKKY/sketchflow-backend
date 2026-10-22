@@ -48,10 +48,17 @@ async fn main() {
         .await
         .expect("failed to run database migrations");
 
+    let collaboration = match config.redis_url.as_deref() {
+        Some(redis_url) => routes::collaboration::CollaborationHub::with_redis(redis_url)
+            .await
+            .unwrap_or_else(|_| panic!("failed to initialize Redis collaboration pub/sub")),
+        None => routes::collaboration::CollaborationHub::default(),
+    };
+
     let state = AppState {
         db: pool,
         config: Arc::new(config.clone()),
-        collaboration: routes::collaboration::CollaborationHub::default(),
+        collaboration,
     };
 
     let origins: Vec<_> = config

@@ -11,6 +11,8 @@ documentation.
 - **axum** — HTTP server/routing
 - **sqlx** (Postgres) — database access, schema mirrors the SketchFlow Prisma
   schema for the models this API owns
+- **Redis** — optional shared Pub/Sub fan-out for collaboration across
+  backend instances
 - **utoipa** + **utoipa-swagger-ui** — OpenAPI spec generation and Swagger UI
 - **jsonwebtoken** + **argon2** — session cookies (JWT) and password hashing
 - **reqwest** — Razorpay and Paddle HTTP clients
@@ -22,6 +24,7 @@ documentation.
 ```bash
 cp .env.example .env
 # edit .env with your Postgres URL, JWT secret, Razorpay keys, etc.
+# set REDIS_URL to enable cross-instance collaboration fan-out
 
 # start Postgres (example using Docker)
 docker run --name sketchflow-db -e POSTGRES_USER=sketchflow \
@@ -97,10 +100,16 @@ board access is periodically revalidated while the socket remains open.
 
 Owners and editors can submit document changes. Viewers can receive snapshots
 and presence but cannot edit. Simultaneous edits are ordered by the backend;
-the last accepted update to a given element wins. The initial implementation
-uses in-process WebSocket fan-out and therefore requires a single backend
-instance. Configure a shared pub/sub broker before scaling to multiple
-instances.
+the last accepted update to a given element wins.
+
+Set `REDIS_URL` to a Redis connection URL to enable shared Pub/Sub fan-out;
+`rediss://` URLs use TLS. All backend instances must use the same Redis service
+and channel. When Redis is unset, collaboration uses in-process fan-out and
+requires a single backend instance. Redis Pub/Sub is transient rather than
+durable: Postgres remains authoritative, and clients must honor
+`resync_required` or a revision gap by fetching a fresh snapshot. Redis is
+required at startup when `REDIS_URL` is configured; subscriber connections
+retry after runtime disconnections.
 
 Canvas edits made through the existing Next.js server actions do not produce
 collaboration operations. Enable collaborative editing only after clients

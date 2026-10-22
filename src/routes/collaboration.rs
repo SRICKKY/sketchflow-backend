@@ -12,6 +12,8 @@ use axum::{
     response::Response,
     Json,
 };
+use futures_util::StreamExt;
+use redis::{aio::ConnectionManager, AsyncCommands, Client as RedisClient};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Mutex};
@@ -33,6 +35,7 @@ const ROOM_CAPACITY: usize = 256;
 const MAX_MESSAGES_PER_SECOND: usize = 60;
 const OPERATION_RETENTION: i64 = 1_000;
 const PROTOCOL_VERSION: u64 = 1;
+const REDIS_CHANNEL: &str = "sketchflow:collaboration:v1";
 const ALLOWED_ELEMENT_TYPES: [&str; 11] = [
     "rectangle",
     "ellipse",
@@ -50,9 +53,31 @@ const ALLOWED_ELEMENT_TYPES: [&str; 11] = [
 #[derive(Clone, Default)]
 pub struct CollaborationHub {
     rooms: Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>,
+    redis_publisher: Option<ConnectionManager>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RedisEvent {
+    board_id: String,
+    message: String,
 }
 
 impl CollaborationHub {
+    pub async fn with_redis(redis_url: &str) -> redis::RedisResult<Self> {
+        let client = RedisClient::open(redis_url)?;
+        let publisher = ConnectionManager::new(client.clone()).await?;
+        let mut subscriber = client.get_async_pubsub().await?;
+        subscriber.subscribe(REDIS_CHANNEL).await?;
+
+        let hub = Self {
+            rooms: Arc::new(Mutex::new(HashMap::new())),
+            redis_publisher: Some(publisher),
+        };
+        tokio::spawn(run_redis_subscriber(client, subscriber, hub.clone()));
+        Ok(hub)
+    }
+
     async fn subscribe(
         &self,
         board_id: &str,
@@ -70,6 +95,82 @@ impl CollaborationHub {
         let mut rooms = self.rooms.lock().await;
         if sender.receiver_count() == 0 {
             rooms.remove(board_id);
+        }
+    }
+
+    async fn publish(&self, board_id: &str, message: String) -> redis::RedisResult<()> {
+        let Some(publisher) = &self.redis_publisher else {
+            return Ok(());
+        };
+        let event = serde_json::to_string(&RedisEvent {
+            board_id: board_id.to_string(),
+            message,
+        })
+        .expect("Redis collaboration event is serializable");
+        let mut connection = publisher.clone();
+        connection.publish(REDIS_CHANNEL, event).await
+    }
+
+    async fn publish_local(&self, board_id: &str, message: String) {
+        if let Some(sender) = self.rooms.lock().await.get(board_id).cloned() {
+            let _ = sender.send(message);
+        }
+    }
+
+    async fn require_local_resync(&self) {
+        let rooms = self.rooms.lock().await;
+        let message = serialize_server_message(&ServerMessage::ResyncRequired);
+        for sender in rooms.values() {
+            let _ = sender.send(message.clone());
+        }
+    }
+}
+
+async fn run_redis_subscriber(
+    client: RedisClient,
+    mut subscriber: redis::aio::PubSub,
+    hub: CollaborationHub,
+) {
+    let mut retry_delay = Duration::from_millis(500);
+    loop {
+        let mut messages = subscriber.on_message();
+        while let Some(message) = messages.next().await {
+            match message.get_payload::<String>() {
+                Ok(payload) => match serde_json::from_str::<RedisEvent>(&payload) {
+                    Ok(event) => hub.publish_local(&event.board_id, event.message).await,
+                    Err(error) => {
+                        tracing::warn!(%error, "ignoring malformed Redis collaboration event")
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(%error, "ignoring invalid Redis collaboration payload")
+                }
+            }
+        }
+        drop(messages);
+
+        tracing::warn!(
+            retry_delay_ms = retry_delay.as_millis(),
+            "Redis collaboration subscription disconnected; reconnecting"
+        );
+        tokio::time::sleep(retry_delay).await;
+        match client.get_async_pubsub().await {
+            Ok(mut next_subscriber) => match next_subscriber.subscribe(REDIS_CHANNEL).await {
+                Ok(()) => {
+                    subscriber = next_subscriber;
+                    retry_delay = Duration::from_millis(500);
+                    tracing::info!("Redis collaboration subscription reconnected");
+                    hub.require_local_resync().await;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to resubscribe to Redis collaboration channel");
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(15));
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, "failed to reconnect Redis collaboration subscriber");
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(15));
+            }
         }
     }
 }
@@ -299,7 +400,9 @@ async fn handle_socket(
         return;
     }
 
-    broadcast_message(
+    publish_message(
+        &state.collaboration,
+        &board_id,
         &room_tx,
         &ServerMessage::PresenceJoined {
             connection_id: connection_id.clone(),
@@ -307,7 +410,8 @@ async fn handle_socket(
             name: user.name.clone(),
             image: user.image.clone(),
         },
-    );
+    )
+    .await;
 
     let mut rate_window = Instant::now();
     let mut messages_in_window = 0;
@@ -405,7 +509,9 @@ async fn handle_socket(
                                     Err(error) => Err(error),
                                 };
                                 match operation {
-                                    Ok(operation) => broadcast_message(
+                                    Ok(operation) => publish_message(
+                                        &state.collaboration,
+                                        &board_id,
                                         &room_tx,
                                         &ServerMessage::OperationApplied {
                                             revision: operation.revision,
@@ -413,7 +519,7 @@ async fn handle_socket(
                                             actor_id: operation.actor_id,
                                             batch: operation.batch,
                                         },
-                                    ),
+                                    ).await,
                                     Err(error) => {
                                         if send_message(&mut socket, &ServerMessage::Error {
                                             message: error.to_string(),
@@ -425,7 +531,9 @@ async fn handle_socket(
                             }
                             ClientMessage::Presence { cursor, selected_ids } => {
                                 match validate_presence(cursor, selected_ids) {
-                                    Ok((cursor, selected_ids)) => broadcast_message(
+                                    Ok((cursor, selected_ids)) => publish_message(
+                                        &state.collaboration,
+                                        &board_id,
                                         &room_tx,
                                         &ServerMessage::PresenceUpdated {
                                             connection_id: connection_id.clone(),
@@ -433,7 +541,7 @@ async fn handle_socket(
                                             cursor,
                                             selected_ids,
                                         },
-                                    ),
+                                    ).await,
                                     Err(error) => {
                                         if send_message(&mut socket, &ServerMessage::Error {
                                             message: error.to_string(),
@@ -498,13 +606,16 @@ async fn handle_socket(
         }
     }
 
-    broadcast_message(
+    publish_message(
+        &state.collaboration,
+        &board_id,
         &room_tx,
         &ServerMessage::PresenceLeft {
             connection_id,
             user_id: user.id,
         },
-    );
+    )
+    .await;
     drop(room_rx);
     state
         .collaboration
@@ -764,9 +875,26 @@ async fn send_message(socket: &mut WebSocket, message: &ServerMessage) -> Result
     socket.send(Message::Text(json.into())).await
 }
 
-fn broadcast_message(sender: &broadcast::Sender<String>, message: &ServerMessage) {
+async fn publish_message(
+    hub: &CollaborationHub,
+    board_id: &str,
+    local_sender: &broadcast::Sender<String>,
+    message: &ServerMessage,
+) {
     let json = serialize_server_message(message);
-    let _ = sender.send(json);
+    if hub.redis_publisher.is_none() {
+        let _ = local_sender.send(json);
+        return;
+    }
+    if let Err(error) = hub.publish(board_id, json).await {
+        tracing::error!(
+            board_id,
+            %error,
+            "failed to publish collaboration event to Redis; local clients must resync"
+        );
+        let resync = serialize_server_message(&ServerMessage::ResyncRequired);
+        let _ = local_sender.send(resync);
+    }
 }
 
 fn serialize_server_message(message: &ServerMessage) -> String {
@@ -848,5 +976,24 @@ mod tests {
         let envelope: Value = serde_json::from_str(&message).unwrap();
         assert_eq!(envelope["type"], "pong");
         assert_eq!(envelope["protocolVersion"], PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn redis_events_keep_board_routing_separate_from_protocol_message() {
+        let event = RedisEvent {
+            board_id: "board-1".to_string(),
+            message: serialize_server_message(&ServerMessage::Pong),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["boardId"], "board-1");
+        assert_eq!(
+            serde_json::from_str::<Value>(json["message"].as_str().unwrap()).unwrap()["type"],
+            "pong"
+        );
+    }
+
+    #[test]
+    fn redis_client_accepts_tls_urls_without_connecting() {
+        assert!(RedisClient::open("rediss://default:test-secret@example.invalid:6379").is_ok());
     }
 }
