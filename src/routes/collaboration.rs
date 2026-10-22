@@ -28,14 +28,19 @@ use crate::{
     state::AppState,
 };
 
+// Bound connection memory, payload validation work, and operation history growth.
 const MAX_MESSAGE_BYTES: usize = 1_048_576;
 const MAX_BATCH_ELEMENTS: usize = 500;
 const MAX_SELECTION_SIZE: usize = 100;
 const ROOM_CAPACITY: usize = 256;
 const MAX_MESSAGES_PER_SECOND: usize = 60;
 const OPERATION_RETENTION: i64 = 1_000;
+
+// Version the JSON protocol and shared Redis channel independently of the HTTP API.
 const PROTOCOL_VERSION: u64 = 1;
 const REDIS_CHANNEL: &str = "sketchflow:collaboration:v1";
+
+// Canvas element types accepted from clients; unknown types cannot be persisted.
 const ALLOWED_ELEMENT_TYPES: [&str; 11] = [
     "rectangle",
     "ellipse",
@@ -51,11 +56,15 @@ const ALLOWED_ELEMENT_TYPES: [&str; 11] = [
 ];
 
 #[derive(Clone, Default)]
+/// Routes collaboration events between local WebSocket rooms and optional Redis.
 pub struct CollaborationHub {
+    // Local socket groups receive events from the current process.
     rooms: Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>,
+    // Shared publisher is present only when Redis fan-out is configured.
     redis_publisher: Option<ConnectionManager>,
 }
 
+// Redis envelopes carry the board routing key separately from the client protocol event.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RedisEvent {
@@ -64,6 +73,7 @@ struct RedisEvent {
 }
 
 impl CollaborationHub {
+    /// Connects the publisher and subscriber before serving requests, then starts the relay.
     pub async fn with_redis(redis_url: &str) -> redis::RedisResult<Self> {
         let client = RedisClient::open(redis_url)?;
         let publisher = ConnectionManager::new(client.clone()).await?;
@@ -78,6 +88,7 @@ impl CollaborationHub {
         Ok(hub)
     }
 
+    /// Adds a local socket to the board's broadcast room, creating the room if needed.
     async fn subscribe(
         &self,
         board_id: &str,
@@ -91,6 +102,7 @@ impl CollaborationHub {
         (sender, receiver)
     }
 
+    /// Releases a room from memory after its final local socket disconnects.
     async fn remove_if_empty(&self, board_id: &str, sender: &broadcast::Sender<String>) {
         let mut rooms = self.rooms.lock().await;
         if sender.receiver_count() == 0 {
@@ -98,6 +110,7 @@ impl CollaborationHub {
         }
     }
 
+    /// Publishes a board-scoped event so every backend instance can relay it to local sockets.
     async fn publish(&self, board_id: &str, message: String) -> redis::RedisResult<()> {
         let Some(publisher) = &self.redis_publisher else {
             return Ok(());
@@ -111,12 +124,14 @@ impl CollaborationHub {
         connection.publish(REDIS_CHANNEL, event).await
     }
 
+    /// Sends a received Redis event only to sockets connected to this board on this instance.
     async fn publish_local(&self, board_id: &str, message: String) {
         if let Some(sender) = self.rooms.lock().await.get(board_id).cloned() {
             let _ = sender.send(message);
         }
     }
 
+    /// Tells local clients to reload a snapshot after this instance may have missed events.
     async fn require_local_resync(&self) {
         let rooms = self.rooms.lock().await;
         let message = serialize_server_message(&ServerMessage::ResyncRequired);
@@ -126,6 +141,7 @@ impl CollaborationHub {
     }
 }
 
+/// Subscribes to shared collaboration events and reconnects with bounded backoff on failure.
 async fn run_redis_subscriber(
     client: RedisClient,
     mut subscriber: redis::aio::PubSub,
@@ -177,6 +193,7 @@ async fn run_redis_subscriber(
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+/// The canvas changes carried by an operation: full replacements and element deletions.
 pub struct ElementBatch {
     pub upserts: Vec<Value>,
     pub deleted_ids: Vec<String>,
@@ -184,20 +201,25 @@ pub struct ElementBatch {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+/// Client requests accepted by the WebSocket protocol.
 enum ClientMessage {
+    /// Applies one revisioned set of canvas changes.
     ApplyOperation {
         #[serde(rename = "clientOperationId")]
         client_operation_id: String,
         batch: ElementBatch,
     },
+    /// Shares transient cursor and selection state with other board participants.
     Presence {
         cursor: Option<Point>,
         #[serde(default, rename = "selectedIds")]
         selected_ids: Vec<String>,
     },
+    /// Answers the application-level heartbeat without changing board state.
     Ping,
 }
 
+/// A cursor location in canvas/world coordinates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Point {
@@ -211,46 +233,55 @@ struct Point {
     rename_all = "snake_case",
     rename_all_fields = "camelCase"
 )]
+/// Events sent by the server to collaboration clients.
 enum ServerMessage {
+    /// Identifies this connection and its permissions before the initial snapshot.
     Connected {
         board_id: String,
         connection_id: String,
         role: String,
     },
+    /// Supplies the current persisted document and revision for initial sync.
     Snapshot {
         board_id: String,
         revision: i64,
         elements: Vec<Value>,
     },
+    /// Confirms a committed operation and broadcasts its assigned revision.
     OperationApplied {
         revision: i64,
         client_operation_id: String,
         actor_id: String,
         batch: ElementBatch,
     },
+    /// Announces a newly connected participant.
     PresenceJoined {
         connection_id: String,
         user_id: String,
         name: Option<String>,
         image: Option<String>,
     },
+    /// Updates a participant's ephemeral cursor and selection.
     PresenceUpdated {
         connection_id: String,
         user_id: String,
         cursor: Option<Point>,
         selected_ids: Vec<String>,
     },
+    /// Removes a participant from the live presence list.
     PresenceLeft {
         connection_id: String,
         user_id: String,
     },
+    /// Response to a client heartbeat.
     Pong,
-    Error {
-        message: String,
-    },
+    /// Reports a rejected request or protocol problem.
+    Error { message: String },
+    /// Indicates that the client must fetch a fresh snapshot before continuing.
     ResyncRequired,
 }
 
+/// REST response body containing a consistent board snapshot and its revision.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotResponse {
@@ -259,12 +290,14 @@ pub struct SnapshotResponse {
     pub elements: Vec<Value>,
 }
 
+/// Minimal database projection used when reading an operation for retry deduplication.
 #[derive(Debug, sqlx::FromRow)]
 struct StoredOperation {
     revision: i64,
     operation: Value,
 }
 
+/// JSON payload stored with an operation for idempotent retries and history.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredOperationPayload {
@@ -272,6 +305,7 @@ struct StoredOperationPayload {
     batch: ElementBatch,
 }
 
+/// A validated operation ready to send to connected clients.
 #[derive(Debug, Clone)]
 struct AppliedOperation {
     revision: i64,
@@ -280,6 +314,7 @@ struct AppliedOperation {
     batch: ElementBatch,
 }
 
+/// Minimal database projection for a canvas element in a snapshot.
 #[derive(Debug, sqlx::FromRow)]
 struct ElementRow {
     data: Value,
@@ -303,6 +338,7 @@ pub async fn snapshot(
     Path(board_id): Path<String>,
     cookies: Cookies,
 ) -> AppResult<Json<SnapshotResponse>> {
+    // Viewer permission is enough to read a document, but never to submit edits.
     let user = session::require_current_user(&cookies, &state).await?;
     authz::require_board_role(&state.db, &board_id, &user.id, BoardRole::Viewer).await?;
     let result = load_snapshot(&state, &board_id).await?;
@@ -317,6 +353,7 @@ pub async fn websocket(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> AppResult<Response> {
+    // WebSockets do not receive browser CORS enforcement, so validate Origin explicitly.
     validate_origin(&state, &headers)?;
     let user = session::require_current_user(&cookies, &state).await?;
     let access =
@@ -327,6 +364,7 @@ pub async fn websocket(
         .on_upgrade(move |socket| handle_socket(socket, state, board_id, user, access.role)))
 }
 
+/// Rejects browser WebSocket handshakes from origins outside the configured allowlist.
 fn validate_origin(state: &AppState, headers: &HeaderMap) -> AppResult<()> {
     let origin = headers
         .get(ORIGIN)
@@ -354,6 +392,7 @@ async fn handle_socket(
     role: BoardRole,
 ) {
     let connection_id = cuid2::create_id();
+    // Subscribe before reading the snapshot so updates arriving during sync are buffered.
     let (room_tx, mut room_rx) = state.collaboration.subscribe(&board_id).await;
 
     let snapshot = match load_snapshot(&state, &board_id).await {
@@ -380,6 +419,7 @@ async fn handle_socket(
         connection_id: connection_id.clone(),
         role: role.as_str().to_string(),
     };
+    // Send connection metadata and the initial document before announcing presence.
     if send_message(&mut socket, &connected).await.is_err()
         || send_message(
             &mut socket,
@@ -415,6 +455,7 @@ async fn handle_socket(
 
     let mut rate_window = Instant::now();
     let mut messages_in_window = 0;
+    // Refresh membership so removed or downgraded users lose access on open sockets.
     let mut authorization_check = tokio::time::interval(Duration::from_secs(30));
     authorization_check.tick().await;
 
@@ -462,6 +503,7 @@ async fn handle_socket(
                             }
                             continue;
                         }
+                        // Decode only after the envelope version is known to be supported.
                         let client_message = match serde_json::from_value::<ClientMessage>(envelope) {
                             Ok(message) => message,
                             Err(_) => {
@@ -475,6 +517,7 @@ async fn handle_socket(
                         };
                         match client_message {
                             ClientMessage::ApplyOperation { client_operation_id, batch } => {
+                                // Reject viewers early, then re-check database authorization before each write.
                                 if role < BoardRole::Editor {
                                     if send_message(&mut socket, &ServerMessage::Error {
                                         message: "You do not have permission to edit this board.".to_string(),
@@ -509,6 +552,7 @@ async fn handle_socket(
                                     Err(error) => Err(error),
                                 };
                                 match operation {
+                                    // Persist before publishing so peers never observe an uncommitted change.
                                     Ok(operation) => publish_message(
                                         &state.collaboration,
                                         &board_id,
@@ -597,6 +641,7 @@ async fn handle_socket(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // A slow socket may have missed events; disconnect it so it can resync.
                         let _ = send_message(&mut socket, &ServerMessage::ResyncRequired).await;
                         break;
                     }
@@ -616,6 +661,7 @@ async fn handle_socket(
         },
     )
     .await;
+    // Broadcast departure before releasing the room receiver and its resources.
     drop(room_rx);
     state
         .collaboration
@@ -623,7 +669,9 @@ async fn handle_socket(
         .await;
 }
 
+/// Checks operation IDs, batch limits, element types, and duplicate IDs before persistence.
 fn validate_operation(client_operation_id: &str, batch: ElementBatch) -> AppResult<ElementBatch> {
+    // Operation IDs are constrained because they are persisted as idempotency keys.
     if client_operation_id.is_empty()
         || client_operation_id.len() > 128
         || !client_operation_id
@@ -634,6 +682,7 @@ fn validate_operation(client_operation_id: &str, batch: ElementBatch) -> AppResu
             "Invalid client operation ID.".to_string(),
         ));
     }
+    // Bound each batch and require actual content before iterating its elements.
     if batch.upserts.len() > MAX_BATCH_ELEMENTS || batch.deleted_ids.len() > MAX_BATCH_ELEMENTS {
         return Err(AppError::BadRequest(
             "Operation contains too many elements.".to_string(),
@@ -645,6 +694,7 @@ fn validate_operation(client_operation_id: &str, batch: ElementBatch) -> AppResu
         ));
     }
 
+    // An element may be changed or deleted only once within one batch.
     let mut ids = HashSet::new();
     for element in &batch.upserts {
         let id = element
@@ -677,10 +727,12 @@ fn validate_operation(client_operation_id: &str, batch: ElementBatch) -> AppResu
     Ok(batch)
 }
 
+/// Checks transient cursor and selection values before they are broadcast.
 fn validate_presence(
     cursor: Option<Point>,
     selected_ids: Vec<String>,
 ) -> AppResult<(Option<Point>, Vec<String>)> {
+    // Presence is ephemeral, but still bounded and checked before being fanned out.
     if selected_ids.len() > MAX_SELECTION_SIZE
         || selected_ids
             .iter()
@@ -699,7 +751,9 @@ fn validate_presence(
     Ok((cursor, selected_ids))
 }
 
+/// Reads board elements with the revision that identifies their persisted state.
 async fn load_snapshot(state: &AppState, board_id: &str) -> AppResult<SnapshotResponse> {
+    // Older boards may not yet have a collaboration revision row.
     sqlx::query(
         r#"INSERT INTO board_collaboration_state (board_id, revision)
            SELECT id, 0 FROM boards WHERE id = $1
@@ -710,6 +764,7 @@ async fn load_snapshot(state: &AppState, board_id: &str) -> AppResult<SnapshotRe
     .await?;
 
     let mut tx = state.db.begin().await?;
+    // Read revision and elements from one database snapshot so they cannot disagree.
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .execute(&mut *tx)
         .await?;
@@ -734,6 +789,7 @@ async fn load_snapshot(state: &AppState, board_id: &str) -> AppResult<SnapshotRe
     })
 }
 
+/// Applies and records one operation atomically, allocating its board revision.
 async fn persist_operation(
     state: &AppState,
     board_id: &str,
@@ -741,6 +797,7 @@ async fn persist_operation(
     client_operation_id: &str,
     batch: ElementBatch,
 ) -> AppResult<AppliedOperation> {
+    // Store the exact request so retries can be compared and acknowledged safely.
     let payload = StoredOperationPayload {
         client_operation_id: client_operation_id.to_string(),
         batch: batch.clone(),
@@ -754,6 +811,8 @@ async fn persist_operation(
     .bind(board_id)
     .execute(&mut *tx)
     .await?;
+
+    // Serialize writes for this board and use the row lock to allocate revisions in order.
     let revision = sqlx::query_scalar::<_, i64>(
         "SELECT revision FROM board_collaboration_state WHERE board_id = $1 FOR UPDATE",
     )
@@ -771,6 +830,7 @@ async fn persist_operation(
     .fetch_optional(&mut *tx)
     .await?
     {
+        // A retry with the same ID and payload returns its original revision without reapplying.
         if existing.operation != payload_json {
             return Err(AppError::Conflict(
                 "Client operation ID was already used for a different change.".to_string(),
@@ -783,6 +843,7 @@ async fn persist_operation(
     let next_revision = revision
         .checked_add(1)
         .ok_or_else(|| AppError::Internal(anyhow::anyhow!("board revision overflow")))?;
+    // Keep revision allocation, operation history, and document mutation atomic.
     sqlx::query(
         "UPDATE board_collaboration_state SET revision = $2, updated_at = now() WHERE board_id = $1",
     )
@@ -827,6 +888,7 @@ async fn persist_operation(
         .execute(&mut *tx)
         .await?;
     }
+    // Deletions and timestamp updates are part of the same transaction as the upserts.
     if !batch.deleted_ids.is_empty() {
         sqlx::query("DELETE FROM board_elements WHERE board_id = $1 AND element_id = ANY($2)")
             .bind(board_id)
@@ -839,6 +901,7 @@ async fn persist_operation(
         .execute(&mut *tx)
         .await?;
     if next_revision > OPERATION_RETENTION {
+        // Snapshots are the recovery path, so only recent operations need remain in the log.
         sqlx::query("DELETE FROM board_operations WHERE board_id = $1 AND revision <= $2")
             .bind(board_id)
             .bind(next_revision - OPERATION_RETENTION)
@@ -855,11 +918,13 @@ async fn persist_operation(
     })
 }
 
+/// Converts an idempotency-log row back into the operation event sent to clients.
 fn applied_operation(
     revision: i64,
     actor_id: &str,
     operation: Value,
 ) -> AppResult<AppliedOperation> {
+    // Reconstruct the original event body for a successful retry acknowledgement.
     let payload: StoredOperationPayload = serde_json::from_value(operation)
         .map_err(|error| AppError::Internal(anyhow::anyhow!(error)))?;
     Ok(AppliedOperation {
@@ -870,11 +935,13 @@ fn applied_operation(
     })
 }
 
+/// Serializes and sends one protocol-versioned message to a WebSocket.
 async fn send_message(socket: &mut WebSocket, message: &ServerMessage) -> Result<(), axum::Error> {
     let json = serialize_server_message(message);
     socket.send(Message::Text(json.into())).await
 }
 
+/// Fans an event out locally or through Redis, asking local clients to resync on failure.
 async fn publish_message(
     hub: &CollaborationHub,
     board_id: &str,
@@ -883,9 +950,11 @@ async fn publish_message(
 ) {
     let json = serialize_server_message(message);
     if hub.redis_publisher.is_none() {
+        // Without Redis, this process is the complete collaboration cluster.
         let _ = local_sender.send(json);
         return;
     }
+    // With Redis, this instance's subscriber delivers the event locally as well as remotely.
     if let Err(error) = hub.publish(board_id, json).await {
         tracing::error!(
             board_id,
@@ -897,7 +966,9 @@ async fn publish_message(
     }
 }
 
+/// Converts a server event to the common JSON envelope used by every transport.
 fn serialize_server_message(message: &ServerMessage) -> String {
+    // Attach the protocol version uniformly so every server event is versioned.
     let mut value = serde_json::to_value(message).expect("server message is serializable");
     value
         .as_object_mut()
@@ -906,6 +977,7 @@ fn serialize_server_message(message: &ServerMessage) -> String {
     serde_json::to_string(&value).expect("server message is serializable")
 }
 
+/// Maps database authorization roles to the stable role names in the wire protocol.
 impl BoardRole {
     fn as_str(self) -> &'static str {
         match self {
