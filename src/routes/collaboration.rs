@@ -994,6 +994,6 @@ mod tests {
 
     #[test]
     fn redis_client_accepts_tls_urls_without_connecting() {
-        assert!(RedisClient::open("rediss://default:test-secret@example.invalid:6379").is_ok());
+        assert!(RedisClient::open("rediss://example.invalid:6379").is_ok());
     }
 }
