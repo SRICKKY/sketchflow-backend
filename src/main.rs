@@ -51,6 +51,7 @@ async fn main() {
     let state = AppState {
         db: pool,
         config: Arc::new(config.clone()),
+        collaboration: routes::collaboration::CollaborationHub::default(),
     };
 
     let origins: Vec<_> = config
@@ -92,6 +93,14 @@ async fn main() {
         )
         .route("/api/uploads", post(routes::uploads::upload_image))
         .route("/api/uploads/{asset_id}", get(routes::uploads::get_asset))
+        .route(
+            "/api/boards/{board_id}/collaboration",
+            get(routes::collaboration::websocket),
+        )
+        .route(
+            "/api/boards/{board_id}/snapshot",
+            get(routes::collaboration::snapshot),
+        )
         .route(
             "/billing/{invoice_id}/pdf",
             get(routes::invoices::download_invoice_pdf),

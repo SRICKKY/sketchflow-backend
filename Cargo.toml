@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 # Web framework
-axum = { version = "0.8", features = ["json", "multipart", "macros"] }
+axum = { version = "0.8", features = ["json", "multipart", "macros", "ws"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "trace", "limit", "fs"] }
