@@ -2,7 +2,8 @@
 
 These routes use the Rust backend's **lowercase SQL schema**, not the Next.js
 Prisma database. Startup runs migrations, including `0003_dashboard.sql` for
-saved templates. Do not point a test run at Neon or a production database.
+saved templates, and `0004_board_list_pagination.sql` for page indexes.
+Do not point a test run at Neon or a production database.
 
 All endpoints require the `sketchflow_session` cookie. JSON requests use
 `Content-Type: application/json`; browser requests must include credentials.
@@ -20,6 +21,7 @@ interface BoardSummary {
   id: string;
   name: string;
   ownerId: string;
+  ownerName: string | null;
   workspaceId: string | null;
   role: BoardRole; // current caller's effective role
   createdAt: string;
@@ -87,7 +89,7 @@ preventing concurrent requests from bypassing limits or owner protections.
 
 | Method / endpoint | Request | Response / permission |
 | --- | --- | --- |
-| `GET /api/boards` | Query below | `{items: BoardSummary[]}` |
+| `GET /api/boards` | Query below | `{items: BoardSummary[], nextCursor: string \| null}` |
 | `POST /api/boards` | `{name?, workspaceId?, templateId?}` | 201 `BoardSummary` |
 | `GET /api/boards/{id}` | — | `BoardSummary`; viewer or higher |
 | `PATCH /api/boards/{id}` | `{name}` | `BoardSummary`; owner only |
@@ -104,9 +106,19 @@ List query parameters:
 - `q=<text>`: case-insensitive literal substring of the name, trimmed, at most
   200 characters. `%` and `_` are literal characters, not SQL wildcards.
 
-Lists are ordered by `updatedAt` descending, then ID. There is no pagination or
-`nextCursor` in this version. Category filtering and template search are
-client-side.
+- `limit=<integer>`: page size, default 12, valid range 1–100; invalid values
+  return 400.
+- `cursor=<opaque token>`: use the previous response's `nextCursor`, unchanged.
+  Invalid or malformed cursors return 400.
+
+Lists use descending `(updatedAt, id)` keyset pagination, including search,
+shared and workspace lists. `nextCursor` is `null` when there are no more rows.
+Keep scope, workspace and search unchanged while loading subsequent pages.
+Authorization and all list filters are reapplied on every page; a cursor grants
+no access. Cursors encode the timestamp and ID, not an offset. Concurrent edits
+can move boards ahead of the current cursor; refresh to see those changes.
+`ownerName` is the current nullable owner display name from the users relation.
+Category filtering and template search are client-side.
 
 Board names are trimmed and must contain 1–80 characters. The default name is
 `Untitled board`, or the selected template's name. Workspace IDs must identify

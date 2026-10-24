@@ -4,6 +4,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -71,6 +72,7 @@ pub struct BoardSummary {
     id: String,
     name: String,
     owner_id: String,
+    owner_name: Option<String>,
     workspace_id: Option<String>,
     role: String,
     created_at: DateTime<Utc>,
@@ -140,6 +142,50 @@ struct Items<T> {
     items: Vec<T>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BoardPage {
+    items: Vec<BoardSummary>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BoardCursor {
+    updated_at: DateTime<Utc>,
+    id: String,
+}
+
+impl BoardCursor {
+    fn decode(value: &str) -> AppResult<Self> {
+        let invalid = || AppError::BadRequest("Invalid board cursor.".into());
+        if value.is_empty() || value.len() > 1024 {
+            return Err(invalid());
+        }
+        let bytes = URL_SAFE_NO_PAD.decode(value).map_err(|_| invalid())?;
+        let cursor: Self = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        if cursor.id.is_empty()
+            || cursor.id.len() > 128
+            || cursor.id.chars().any(char::is_control)
+            || cursor.updated_at.timestamp() < 0
+            || cursor.updated_at.timestamp() > 253402300799
+        {
+            return Err(invalid());
+        }
+        Ok(cursor)
+    }
+
+    fn encode(board: &BoardSummary) -> String {
+        URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&Self {
+                updated_at: board.updated_at,
+                id: board.id.clone(),
+            })
+            .expect("board cursor serializes"),
+        )
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BoardInput {
@@ -160,6 +206,8 @@ struct BoardQuery {
     scope: Option<String>,
     workspace_id: Option<String>,
     q: Option<String>,
+    limit: Option<u32>,
+    cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -359,10 +407,11 @@ async fn dashboard(
     }))
 }
 
-const BOARD_SELECT: &str = "SELECT b.id,b.name,b.owner_id,b.workspace_id,b.created_at,b.updated_at,
+const BOARD_SELECT: &str = "SELECT b.id,b.name,b.owner_id,owner.name AS owner_name,b.workspace_id,b.created_at,b.updated_at,
     CASE WHEN b.owner_id=$1 THEN 'OWNER' ELSE COALESCE(m.role::text,CASE WHEN wm.role::text IN ('OWNER','ADMIN') THEN 'EDITOR' ELSE 'VIEWER' END) END AS role,
     (SELECT count(*) FROM board_elements e WHERE e.board_id=b.id) AS element_count
-    FROM boards b LEFT JOIN board_members m ON m.board_id=b.id AND m.user_id=$1
+    FROM boards b JOIN users owner ON owner.id=b.owner_id
+    LEFT JOIN board_members m ON m.board_id=b.id AND m.user_id=$1
     LEFT JOIN workspace_members wm ON wm.workspace_id=b.workspace_id AND wm.user_id=$1";
 
 async fn board_summary(db: &PgPool, board_id: &str, user_id: &str) -> AppResult<BoardSummary> {
@@ -378,10 +427,21 @@ async fn list_boards(
     State(state): State<AppState>,
     cookies: Cookies,
     query: Result<Query<BoardQuery>, axum::extract::rejection::QueryRejection>,
-) -> AppResult<Json<Items<BoardSummary>>> {
+) -> AppResult<Json<BoardPage>> {
     let user = session::require_current_user(&cookies, &state).await?;
     let Query(query) =
         query.map_err(|_| AppError::BadRequest("Invalid query parameters.".into()))?;
+    let limit = query.limit.unwrap_or(12);
+    if !(1..=100).contains(&limit) {
+        return Err(AppError::BadRequest(
+            "limit must be between 1 and 100.".into(),
+        ));
+    }
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(BoardCursor::decode)
+        .transpose()?;
     let scope = query.scope.as_deref().unwrap_or("owned");
     if !matches!(scope, "owned" | "shared") {
         return Err(AppError::BadRequest(
@@ -404,10 +464,26 @@ async fn list_boards(
     } else {
         "b.workspace_id IS NULL AND b.owner_id=$1 AND $2::text IS NULL"
     };
-    let items = sqlx::query_as(&format!("{BOARD_SELECT} WHERE {condition} AND strpos(lower(b.name),lower($3))>0 ORDER BY b.updated_at DESC,b.id"))
-        .bind(&user.id).bind(workspace).bind(query.q.unwrap_or_default().trim())
-        .fetch_all(&state.db).await?;
-    Ok(Json(Items { items }))
+    let mut items: Vec<BoardSummary> = sqlx::query_as(&format!(
+        "{BOARD_SELECT} WHERE {condition} AND strpos(lower(b.name),lower($3))>0
+        AND ($4::timestamptz IS NULL OR (b.updated_at,b.id)<($4,$5))
+        ORDER BY b.updated_at DESC,b.id DESC LIMIT $6"
+    ))
+    .bind(&user.id)
+    .bind(workspace)
+    .bind(query.q.unwrap_or_default().trim())
+    .bind(cursor.as_ref().map(|c| c.updated_at))
+    .bind(cursor.as_ref().map(|c| c.id.as_str()))
+    .bind(i64::from(limit) + 1)
+    .fetch_all(&state.db)
+    .await?;
+    let next_cursor = if items.len() > limit as usize {
+        items.truncate(limit as usize);
+        items.last().map(BoardCursor::encode)
+    } else {
+        None
+    };
+    Ok(Json(BoardPage { items, next_cursor }))
 }
 
 async fn get_board(

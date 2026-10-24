@@ -36,6 +36,26 @@ fn validates_names_roles_and_template_input() {
 }
 
 #[test]
+fn validates_opaque_board_cursor() {
+    let timestamp = "2026-10-24T09:00:00.123456Z";
+    let encode = |value: Value| URL_SAFE_NO_PAD.encode(value.to_string());
+    let cursor = encode(json!({"updatedAt":timestamp,"id":"board-123"}));
+    assert_eq!(BoardCursor::decode(&cursor).unwrap().id, "board-123");
+    for value in [
+        "",
+        "not-a-cursor",
+        &"x".repeat(1025),
+        &encode(json!({"updatedAt":timestamp,"id":""})),
+        &encode(json!({"updatedAt":"not-a-date","id":"x"})),
+        &encode(json!({"updatedAt":timestamp,"id":"x","extra":1})),
+        &encode(json!({"updatedAt":timestamp,"id":"x\n"})),
+        &encode(json!({"updatedAt":"1969-01-01T00:00:00Z","id":"x"})),
+    ] {
+        assert!(BoardCursor::decode(value).is_err(), "{value}");
+    }
+}
+
+#[test]
 fn actual_builtins_remint_ids_and_bindings() {
     let templates = builtin_templates();
     assert_eq!(templates.len(), 7);
@@ -162,6 +182,155 @@ async fn dashboard_http_flows_and_authorization() {
     let admin_token = token("admin");
     let member_token = token("member");
     let expired = token("expired");
+    for query in [
+        "limit=0",
+        "limit=101",
+        "limit=-1",
+        "limit=abc",
+        "limit=1.5",
+        "cursor=invalid",
+        "cursor=",
+    ] {
+        request(
+            &app,
+            Some(&pro),
+            "GET",
+            &format!("/api/boards?{query}"),
+            None,
+            400,
+        )
+        .await;
+    }
+    let page_owner = "pageowner";
+    user(&db, page_owner, "pro", false).await;
+    let page_token = token(page_owner);
+    sqlx::query("INSERT INTO boards(id,name,owner_id,updated_at)
+        SELECT 'page-'||lpad(n::text,3,'0'),'Paging board',$1,'2026-10-24T09:00:00.123456Z'::timestamptz FROM generate_series(1,25) n")
+        .bind(page_owner).execute(&db).await.unwrap();
+    sqlx::query("INSERT INTO boards(id,name,owner_id,updated_at) VALUES('page-private','Paging board','other','2026-10-24T09:00:00.123456Z')")
+        .execute(&db).await.unwrap();
+    let first = request(&app, Some(&page_token), "GET", "/api/boards", None, 200).await;
+    assert_eq!(first["items"].as_array().unwrap().len(), 12);
+    assert_eq!(first["items"][0]["id"], "page-025");
+    assert_eq!(first["items"][0]["ownerName"], page_owner);
+    let second = request(
+        &app,
+        Some(&page_token),
+        "GET",
+        &format!(
+            "/api/boards?cursor={}",
+            first["nextCursor"].as_str().unwrap()
+        ),
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(second["items"].as_array().unwrap().len(), 12);
+    assert_eq!(second["items"][0]["id"], "page-013");
+    let third = request(
+        &app,
+        Some(&page_token),
+        "GET",
+        &format!(
+            "/api/boards?cursor={}",
+            second["nextCursor"].as_str().unwrap()
+        ),
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(third["items"].as_array().unwrap().len(), 1);
+    assert_eq!(third["items"][0]["id"], "page-001");
+    assert!(third["nextCursor"].is_null());
+    let mut seen = std::collections::HashSet::new();
+    for page in [&first, &second, &third] {
+        for board in page["items"].as_array().unwrap() {
+            assert!(seen.insert(board["id"].as_str().unwrap()));
+        }
+    }
+    assert_eq!(seen.len(), 25);
+    let filtered = request(
+        &app,
+        Some(&page_token),
+        "GET",
+        "/api/boards?limit=1&q=missing",
+        None,
+        200,
+    )
+    .await;
+    assert!(filtered["items"].as_array().unwrap().is_empty());
+    assert!(filtered["nextCursor"].is_null());
+    let all = request(
+        &app,
+        Some(&page_token),
+        "GET",
+        "/api/boards?limit=100",
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(all["items"].as_array().unwrap().len(), 25);
+    assert!(all["nextCursor"].is_null());
+    sqlx::query("UPDATE users SET name=NULL WHERE id=$1")
+        .bind(page_owner)
+        .execute(&db)
+        .await
+        .unwrap();
+    let nullable = request(
+        &app,
+        Some(&page_token),
+        "GET",
+        "/api/boards?limit=1",
+        None,
+        200,
+    )
+    .await;
+    assert!(nullable["items"][0]["ownerName"].is_null());
+    sqlx::query(
+        "INSERT INTO board_members(id,board_id,user_id,role)
+        SELECT 'shared-'||id,id,'guest','VIEWER' FROM boards WHERE owner_id=$1",
+    )
+    .bind(page_owner)
+    .execute(&db)
+    .await
+    .unwrap();
+    let shared_page = request(
+        &app,
+        Some(&guest),
+        "GET",
+        "/api/boards?scope=shared&limit=2&q=Paging",
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(shared_page["items"][0]["id"], "page-025");
+    assert_eq!(shared_page["items"][0]["role"], "VIEWER");
+    let shared_next = request(
+        &app,
+        Some(&guest),
+        "GET",
+        &format!(
+            "/api/boards?scope=shared&limit=2&q=Paging&cursor={}",
+            shared_page["nextCursor"].as_str().unwrap()
+        ),
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(shared_next["items"][0]["id"], "page-023");
+    let unauthorized_cursor = request(
+        &app,
+        Some(&free),
+        "GET",
+        &format!(
+            "/api/boards?scope=shared&cursor={}",
+            shared_page["nextCursor"].as_str().unwrap()
+        ),
+        None,
+        200,
+    )
+    .await;
+    assert!(unauthorized_cursor["items"].as_array().unwrap().is_empty());
     request(&app, None, "GET", "/api/dashboard", None, 401).await;
     request(&app, Some("invalid"), "GET", "/api/boards", None, 401).await;
     let caps = request(&app, Some(&free), "GET", "/api/dashboard", None, 200).await;
@@ -649,6 +818,47 @@ async fn dashboard_http_flows_and_authorization() {
     .await;
     assert_eq!(team_list["items"][0]["role"], "EDITOR");
     assert_eq!(team_list["items"][0]["elementCount"], 18);
+    assert_eq!(team_list["items"][0]["ownerName"], "member");
+    sqlx::query("INSERT INTO boards(id,name,owner_id,workspace_id,updated_at)
+        SELECT 'workspace-page-'||lpad(n::text,3,'0'),'Workspace pagination','member',$1,'2026-10-24T09:00:00.123456Z'::timestamptz FROM generate_series(1,3) n")
+        .bind(workspace_id).execute(&db).await.unwrap();
+    let ws_first = request(
+        &app,
+        Some(&pro),
+        "GET",
+        &format!("/api/boards?workspaceId={workspace_id}&limit=2&q=pagination"),
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(ws_first["items"][0]["id"], "workspace-page-003");
+    let ws_second = request(
+        &app,
+        Some(&pro),
+        "GET",
+        &format!(
+            "/api/boards?workspaceId={workspace_id}&limit=2&q=pagination&cursor={}",
+            ws_first["nextCursor"].as_str().unwrap()
+        ),
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(ws_second["items"].as_array().unwrap().len(), 1);
+    assert_eq!(ws_second["items"][0]["id"], "workspace-page-001");
+    assert!(ws_second["nextCursor"].is_null());
+    request(
+        &app,
+        Some(&page_token),
+        "GET",
+        &format!(
+            "/api/boards?workspaceId={workspace_id}&cursor={}",
+            ws_first["nextCursor"].as_str().unwrap()
+        ),
+        None,
+        404,
+    )
+    .await;
     request(
         &app,
         Some(&free),
