@@ -670,7 +670,10 @@ async fn handle_socket(
 }
 
 /// Checks operation IDs, batch limits, element types, and duplicate IDs before persistence.
-fn validate_operation(client_operation_id: &str, batch: ElementBatch) -> AppResult<ElementBatch> {
+pub(super) fn validate_operation(
+    client_operation_id: &str,
+    batch: ElementBatch,
+) -> AppResult<ElementBatch> {
     // Operation IDs are constrained because they are persisted as idempotency keys.
     if client_operation_id.is_empty()
         || client_operation_id.len() > 128
