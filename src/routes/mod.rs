@@ -2,6 +2,7 @@ pub mod auth;
 pub mod billing;
 pub mod collaboration;
 pub mod dashboard;
+pub mod editor;
 pub mod health;
 pub mod invoices;
 pub mod profile;

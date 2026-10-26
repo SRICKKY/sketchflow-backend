@@ -4,6 +4,7 @@ mod authz;
 mod billing;
 mod config;
 mod db;
+mod editor;
 mod error;
 mod extract;
 mod models;
@@ -78,6 +79,7 @@ async fn main() {
             axum::http::Method::GET,
             axum::http::Method::POST,
             axum::http::Method::PATCH,
+            axum::http::Method::PUT,
             axum::http::Method::DELETE,
             axum::http::Method::OPTIONS,
         ]);
@@ -115,6 +117,7 @@ async fn main() {
         )
         .merge(openapi::swagger_ui())
         .merge(routes::dashboard::router())
+        .merge(routes::editor::router())
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .layer(CookieManagerLayer::new())

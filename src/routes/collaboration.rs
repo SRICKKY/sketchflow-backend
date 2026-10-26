@@ -34,7 +34,6 @@ const MAX_BATCH_ELEMENTS: usize = 500;
 const MAX_SELECTION_SIZE: usize = 100;
 const ROOM_CAPACITY: usize = 256;
 const MAX_MESSAGES_PER_SECOND: usize = 60;
-const OPERATION_RETENTION: i64 = 1_000;
 
 // Version the JSON protocol and shared Redis channel independently of the HTTP API.
 const PROTOCOL_VERSION: u64 = 1;
@@ -100,6 +99,15 @@ impl CollaborationHub {
             .clone();
         let receiver = sender.subscribe();
         (sender, receiver)
+    }
+
+    /// Returns the active local room sender, or a temporary sender when no
+    /// socket is connected. The temporary room is deliberately not retained.
+    async fn room(&self, board_id: &str) -> broadcast::Sender<String> {
+        if let Some(sender) = self.rooms.lock().await.get(board_id).cloned() {
+            return sender;
+        }
+        broadcast::channel(ROOM_CAPACITY).0
     }
 
     /// Releases a room from memory after its final local socket disconnects.
@@ -207,6 +215,8 @@ enum ClientMessage {
     ApplyOperation {
         #[serde(rename = "clientOperationId")]
         client_operation_id: String,
+        #[serde(default, rename = "baseRevision")]
+        base_revision: Option<i64>,
         batch: ElementBatch,
     },
     /// Shares transient cursor and selection state with other board participants.
@@ -288,30 +298,6 @@ pub struct SnapshotResponse {
     pub board_id: String,
     pub revision: i64,
     pub elements: Vec<Value>,
-}
-
-/// Minimal database projection used when reading an operation for retry deduplication.
-#[derive(Debug, sqlx::FromRow)]
-struct StoredOperation {
-    revision: i64,
-    operation: Value,
-}
-
-/// JSON payload stored with an operation for idempotent retries and history.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StoredOperationPayload {
-    client_operation_id: String,
-    batch: ElementBatch,
-}
-
-/// A validated operation ready to send to connected clients.
-#[derive(Debug, Clone)]
-struct AppliedOperation {
-    revision: i64,
-    client_operation_id: String,
-    actor_id: String,
-    batch: ElementBatch,
 }
 
 /// Minimal database projection for a canvas element in a snapshot.
@@ -516,7 +502,7 @@ async fn handle_socket(
                             }
                         };
                         match client_message {
-                            ClientMessage::ApplyOperation { client_operation_id, batch } => {
+                            ClientMessage::ApplyOperation { client_operation_id, base_revision, batch } => {
                                 // Reject viewers early, then re-check database authorization before each write.
                                 if role < BoardRole::Editor {
                                     if send_message(&mut socket, &ServerMessage::Error {
@@ -543,6 +529,7 @@ async fn handle_socket(
                                                 &board_id,
                                                 &user.id,
                                                 &operation_id,
+                                                base_revision,
                                                 batch,
                                             )
                                             .await,
@@ -798,144 +785,49 @@ async fn persist_operation(
     board_id: &str,
     actor_id: &str,
     client_operation_id: &str,
+    base_revision: Option<i64>,
     batch: ElementBatch,
-) -> AppResult<AppliedOperation> {
-    // Store the exact request so retries can be compared and acknowledged safely.
-    let payload = StoredOperationPayload {
-        client_operation_id: client_operation_id.to_string(),
-        batch: batch.clone(),
-    };
-    let payload_json = serde_json::to_value(&payload)
-        .map_err(|error| AppError::Internal(anyhow::anyhow!(error)))?;
-    let mut tx = state.db.begin().await?;
-    sqlx::query(
-        "INSERT INTO board_collaboration_state (board_id, revision) VALUES ($1, 0) ON CONFLICT (board_id) DO NOTHING",
-    )
-    .bind(board_id)
-    .execute(&mut *tx)
-    .await?;
-
-    // Serialize writes for this board and use the row lock to allocate revisions in order.
-    let revision = sqlx::query_scalar::<_, i64>(
-        "SELECT revision FROM board_collaboration_state WHERE board_id = $1 FOR UPDATE",
-    )
-    .bind(board_id)
-    .fetch_one(&mut *tx)
-    .await?;
-
-    if let Some(existing) = sqlx::query_as::<_, StoredOperation>(
-        r#"SELECT revision, operation FROM board_operations
-           WHERE board_id = $1 AND actor_id = $2 AND client_operation_id = $3"#,
-    )
-    .bind(board_id)
-    .bind(actor_id)
-    .bind(client_operation_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    {
-        // A retry with the same ID and payload returns its original revision without reapplying.
-        if existing.operation != payload_json {
-            return Err(AppError::Conflict(
-                "Client operation ID was already used for a different change.".to_string(),
-            ));
-        }
-        tx.commit().await?;
-        return applied_operation(existing.revision, actor_id, existing.operation);
-    }
-
-    let next_revision = revision
-        .checked_add(1)
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("board revision overflow")))?;
-    // Keep revision allocation, operation history, and document mutation atomic.
-    sqlx::query(
-        "UPDATE board_collaboration_state SET revision = $2, updated_at = now() WHERE board_id = $1",
-    )
-    .bind(board_id)
-    .bind(next_revision)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        r#"INSERT INTO board_operations
-           (id, board_id, revision, actor_id, client_operation_id, operation)
-           VALUES ($1, $2, $3, $4, $5, $6)"#,
-    )
-    .bind(cuid2::create_id())
-    .bind(board_id)
-    .bind(next_revision)
-    .bind(actor_id)
-    .bind(client_operation_id)
-    .bind(&payload_json)
-    .execute(&mut *tx)
-    .await?;
-
-    for element in &batch.upserts {
-        let element_id = element
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AppError::BadRequest("Invalid element ID.".to_string()))?;
-        let element_type = element
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AppError::BadRequest("Invalid element type.".to_string()))?;
-        sqlx::query(
-            r#"INSERT INTO board_elements (id, board_id, element_id, type, data)
-               VALUES ($1, $2, $3, $4, $5)
-               ON CONFLICT (board_id, element_id) DO UPDATE
-               SET type = EXCLUDED.type, data = EXCLUDED.data, updated_at = now()"#,
-        )
-        .bind(cuid2::create_id())
-        .bind(board_id)
-        .bind(element_id)
-        .bind(element_type)
-        .bind(element)
-        .execute(&mut *tx)
-        .await?;
-    }
-    // Deletions and timestamp updates are part of the same transaction as the upserts.
-    if !batch.deleted_ids.is_empty() {
-        sqlx::query("DELETE FROM board_elements WHERE board_id = $1 AND element_id = ANY($2)")
-            .bind(board_id)
-            .bind(&batch.deleted_ids)
-            .execute(&mut *tx)
-            .await?;
-    }
-    sqlx::query("UPDATE boards SET updated_at = now() WHERE id = $1")
-        .bind(board_id)
-        .execute(&mut *tx)
-        .await?;
-    if next_revision > OPERATION_RETENTION {
-        // Snapshots are the recovery path, so only recent operations need remain in the log.
-        sqlx::query("DELETE FROM board_operations WHERE board_id = $1 AND revision <= $2")
-            .bind(board_id)
-            .bind(next_revision - OPERATION_RETENTION)
-            .execute(&mut *tx)
-            .await?;
-    }
-    tx.commit().await?;
-
-    Ok(AppliedOperation {
-        revision: next_revision,
-        client_operation_id: client_operation_id.to_string(),
-        actor_id: actor_id.to_string(),
+) -> AppResult<crate::editor::store::AppliedOperation> {
+    let operation = crate::editor::store::apply_patch(
+        &state.db,
+        board_id,
+        actor_id,
+        client_operation_id,
+        base_revision,
         batch,
-    })
+    )
+    .await?;
+    if !operation.replayed {
+        crate::editor::store::maybe_create_auto_version(&state.db, board_id, actor_id).await;
+    }
+    Ok(operation)
 }
 
-/// Converts an idempotency-log row back into the operation event sent to clients.
-fn applied_operation(
-    revision: i64,
-    actor_id: &str,
-    operation: Value,
-) -> AppResult<AppliedOperation> {
-    // Reconstruct the original event body for a successful retry acknowledgement.
-    let payload: StoredOperationPayload = serde_json::from_value(operation)
-        .map_err(|error| AppError::Internal(anyhow::anyhow!(error)))?;
-    Ok(AppliedOperation {
-        revision,
-        client_operation_id: payload.client_operation_id,
-        actor_id: actor_id.to_string(),
-        batch: payload.batch,
-    })
+pub async fn broadcast_editor_operation(
+    hub: &CollaborationHub,
+    board_id: &str,
+    operation: &crate::editor::store::AppliedOperation,
+    resync: bool,
+) {
+    if operation.replayed {
+        return;
+    }
+    let room = hub.room(board_id).await;
+    publish_message(
+        hub,
+        board_id,
+        &room,
+        &ServerMessage::OperationApplied {
+            revision: operation.revision,
+            client_operation_id: operation.client_operation_id.clone(),
+            actor_id: operation.actor_id.clone(),
+            batch: operation.batch.clone(),
+        },
+    )
+    .await;
+    if resync {
+        publish_message(hub, board_id, &room, &ServerMessage::ResyncRequired).await;
+    }
 }
 
 /// Serializes and sends one protocol-versioned message to a WebSocket.
