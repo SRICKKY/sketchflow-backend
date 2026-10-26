@@ -20,6 +20,12 @@ pub enum AppError {
     NotFound(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("{message}")]
+    RevisionConflict {
+        code: &'static str,
+        message: String,
+        revision: i64,
+    },
     #[error("{0}")]
     TooManyRequests(String),
     #[error("{0}")]
@@ -45,6 +51,7 @@ impl AppError {
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
+            AppError::RevisionConflict { message, .. } => (StatusCode::CONFLICT, message.clone()),
             AppError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
             AppError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
             AppError::Gateway(status, msg) => (
@@ -64,6 +71,20 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        if let AppError::RevisionConflict {
+            code,
+            ref message,
+            revision,
+        } = self
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": message, "code": code, "revision": revision
+                })),
+            )
+                .into_response();
+        }
         let (status, message) = self.status_and_message();
         (status, Json(json!({ "error": message }))).into_response()
     }

@@ -1,6 +1,8 @@
 //! Plan limit constants and checks, mirroring `@/lib/billing/limits.ts`
-//! and the subset of `@/server/planLimits.ts` needed by the endpoints this
-//! backend exposes (board image uploads).
+//! and the subset of `@/server/planLimits.ts` needed by dashboard and upload APIs.
+
+pub const FREE_MAX_OWNED_BOARDS: i64 = 5;
+pub const FREE_MAX_BOARD_MEMBERS: i64 = 2;
 
 pub const FREE_MAX_IMAGES_PER_BOARD: i64 = 10;
 pub const PRO_MAX_IMAGES_PER_BOARD: i64 = 100;
