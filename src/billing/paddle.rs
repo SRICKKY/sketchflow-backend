@@ -327,6 +327,26 @@ fn parse_minor_amount(value: Option<&Value>) -> Option<i64> {
     }
 }
 
+fn validate_transaction_amounts(
+    totals: &Value,
+    catalog_amount: i64,
+    expected_amount: i64,
+) -> Result<i64, AppError> {
+    let totals = totals
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest("Paddle transaction totals are invalid.".into()))?;
+    let discount = parse_minor_amount(totals.get("discount"))
+        .ok_or_else(|| AppError::BadRequest("Paddle transaction totals are invalid.".into()))?;
+    let paid = parse_minor_amount(totals.get("grand_total").or_else(|| totals.get("total")))
+        .ok_or_else(|| AppError::BadRequest("Paddle transaction totals are invalid.".into()))?;
+    if catalog_amount.saturating_sub(discount) != expected_amount || paid < expected_amount {
+        return Err(AppError::BadRequest(
+            "Paddle transaction amount does not match the checkout.".to_string(),
+        ));
+    }
+    Ok(paid)
+}
+
 async fn fetch_transaction(
     config: &AppConfig,
     transaction_id: &str,
@@ -434,25 +454,8 @@ async fn verify_transaction(
         ));
     }
 
-    let totals = transaction
-        .details
-        .totals
-        .as_object()
-        .ok_or_else(|| AppError::BadRequest("Paddle transaction totals are invalid.".into()))?;
-    let subtotal = parse_minor_amount(totals.get("subtotal"))
-        .ok_or_else(|| AppError::BadRequest("Paddle transaction totals are invalid.".into()))?;
-    let discount = parse_minor_amount(totals.get("discount"))
-        .ok_or_else(|| AppError::BadRequest("Paddle transaction totals are invalid.".into()))?;
-    let paid = parse_minor_amount(totals.get("grand_total").or_else(|| totals.get("total")))
-        .ok_or_else(|| AppError::BadRequest("Paddle transaction totals are invalid.".into()))?;
-    if subtotal != catalog_amount
-        || subtotal.saturating_sub(discount) != expected_amount
-        || paid < expected_amount
-    {
-        return Err(AppError::BadRequest(
-            "Paddle transaction amount does not match the checkout.".to_string(),
-        ));
-    }
+    let paid =
+        validate_transaction_amounts(&transaction.details.totals, catalog_amount, expected_amount)?;
 
     Ok((transaction, user_id, interval, paid))
 }
@@ -561,6 +564,43 @@ mod tests {
             transaction.items[0].price_id(),
             Some("pri_01h00000000000000000000001")
         );
+    }
+
+    #[test]
+    fn accepts_the_expected_total_when_paddle_reports_tax_separately() {
+        let totals = json!({
+            "subtotal": "424",
+            "discount": "0",
+            "tax": "76",
+            "total": "500",
+            "grand_total": "500"
+        });
+
+        assert_eq!(
+            validate_transaction_amounts(&totals, 500, 500).unwrap(),
+            500
+        );
+    }
+
+    #[test]
+    fn rejects_a_discount_mismatch_or_underpayment() {
+        let wrong_discount = json!({
+            "subtotal": "424",
+            "discount": "1",
+            "tax": "76",
+            "total": "499",
+            "grand_total": "499"
+        });
+        assert!(validate_transaction_amounts(&wrong_discount, 500, 500).is_err());
+
+        let underpaid = json!({
+            "subtotal": "423",
+            "discount": "0",
+            "tax": "76",
+            "total": "499",
+            "grand_total": "499"
+        });
+        assert!(validate_transaction_amounts(&underpaid, 500, 500).is_err());
     }
 
     #[test]
