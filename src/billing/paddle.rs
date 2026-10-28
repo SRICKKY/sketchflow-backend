@@ -61,8 +61,25 @@ struct PaddleTransaction {
 
 #[derive(Debug, Deserialize)]
 struct PaddleTransactionItem {
-    price_id: String,
+    #[serde(default)]
+    price_id: Option<String>,
+    #[serde(default)]
+    price: Option<PaddleTransactionPrice>,
     quantity: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaddleTransactionPrice {
+    id: String,
+}
+
+impl PaddleTransactionItem {
+    fn price_id(&self) -> Option<&str> {
+        self.price
+            .as_ref()
+            .map(|price| price.id.as_str())
+            .or(self.price_id.as_deref())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -404,7 +421,7 @@ async fn verify_transaction(
     let price_id = configured_price_id(config, interval)?;
     let catalog_amount = expected_catalog_amount_minor(config, interval);
     if transaction.items.len() != 1
-        || transaction.items[0].price_id != price_id
+        || transaction.items[0].price_id() != Some(price_id)
         || transaction.items[0].quantity != 1
         || expected_amount <= 0
         || (expected_amount != catalog_amount
@@ -524,6 +541,26 @@ mod tests {
         assert_eq!(checkout_amount_to_paddle_minor(50_000), Some(500));
         assert_eq!(checkout_amount_to_paddle_minor(500_000), Some(5_000));
         assert_eq!(checkout_amount_to_paddle_minor(0), None);
+    }
+
+    #[test]
+    fn parses_paddle_transaction_items_with_nested_price() {
+        let transaction: PaddleTransaction = serde_json::from_value(json!({
+            "id": "txn_01h00000000000000000000001",
+            "status": "completed",
+            "currency_code": "USD",
+            "items": [{
+                "price": { "id": "pri_01h00000000000000000000001" },
+                "quantity": 1
+            }],
+            "details": { "totals": {} }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            transaction.items[0].price_id(),
+            Some("pri_01h00000000000000000000001")
+        );
     }
 
     #[test]
