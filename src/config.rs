@@ -14,6 +14,7 @@ pub struct AppConfig {
     pub asset_storage_dir: String,
     pub s3_bucket: Option<String>,
     pub s3_region: Option<String>,
+    pub s3_endpoint_url: Option<String>,
     pub s3_access_key_id: Option<String>,
     pub s3_secret_access_key: Option<String>,
     pub s3_session_token: Option<String>,
@@ -72,6 +73,7 @@ impl AppConfig {
             s3_bucket: env_option("S3_BUCKET"),
             s3_region: preferred_env("S3_REGION", "AWS_REGION")
                 .or_else(|| env_option("AWS_DEFAULT_REGION")),
+            s3_endpoint_url: env_option("S3_ENDPOINT_URL"),
             s3_access_key_id: preferred_env("S3_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"),
             s3_secret_access_key: preferred_env("S3_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"),
             s3_session_token: preferred_env("S3_SESSION_TOKEN", "AWS_SESSION_TOKEN"),

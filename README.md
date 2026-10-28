@@ -16,10 +16,91 @@ documentation.
 - **utoipa** + **utoipa-swagger-ui** — OpenAPI spec generation and Swagger UI
 - **jsonwebtoken** + **argon2** — session cookies (JWT) and password hashing
 - **reqwest** — Razorpay and Paddle HTTP clients
-- **aws-sdk-s3** — optional image and avatar storage in Amazon S3
+- **aws-sdk-s3** — image and avatar storage in S3-compatible object stores,
+  including local Silo
 - **printpdf** — invoice PDF generation
 
 ## Getting started
+
+### Docker Compose (local development)
+
+With Docker Desktop running, execute these commands from this backend directory:
+
+```bash
+docker compose up -d --wait --wait-timeout 120 silo
+docker compose --profile setup run --rm silo-init
+docker compose up --build -d --wait --wait-timeout 120 backend
+curl --fail http://localhost:8080/health
+docker compose logs -f backend
+```
+
+The first build compiles Rust dependencies and can take several minutes. Compose
+starts PostgreSQL 16, Redis 7, and Silo, then creates the asset bucket before
+starting the API. The API automatically applies its embedded SQL migrations on
+startup; you do not need Rust or `sqlx-cli` installed on your host.
+
+- API: `http://localhost:8080`
+- Swagger UI: `http://localhost:8080/docs`
+- Silo console: `http://localhost:9001`
+- WebSocket: `ws://localhost:8080/api/boards/{boardId}/collaboration`
+- PostgreSQL data, Silo objects, and fallback uploads persist in named Docker
+  volumes. The existing `minio_data` volume is retained for compatible object
+  data when switching from MinIO.
+- PostgreSQL, Redis, and Silo's S3 API are internal to the Compose network;
+  the API and Silo console are published only on localhost.
+
+No `.env` file is required. This setup intentionally uses a **separate local
+database**, not the Next.js app's Neon database. Existing Neon users and boards
+will not appear in it. The backend's migrations use a separate, lowercase SQL
+schema; do not point them at the Next.js database without a reviewed migration
+and authentication integration plan.
+
+Compose reads optional `JWT_SECRET`, `JWT_SESSION_DAYS`, `CORS_ALLOWED_ORIGINS`,
+`BACKEND_PORT`, `S3_BUCKET`, `S3_REGION`, `S3_ACCESS_KEY_ID`,
+`S3_SECRET_ACCESS_KEY`, and `RUST_LOG` values from
+your shell or backend `.env`. It deliberately ignores `DATABASE_URL` and
+`REDIS_URL` there and uses the local services instead. The Compose backend
+connects to Silo at `http://silo:9000`. The development database password,
+Silo credentials, and default JWT secret are **local-only defaults**, not
+production configuration.
+
+If port 8080 is already occupied:
+
+```bash
+BACKEND_PORT=8081 docker compose up --build -d --wait --wait-timeout 120
+curl --fail http://localhost:8081/health
+```
+
+To stop the stack while retaining users, boards, and uploads:
+
+```bash
+docker compose down
+```
+
+Do not add `--volumes` unless you intend to permanently delete the local
+database and uploaded files. After editing Rust code, run the `up --build`
+command again to rebuild and restart the API.
+
+The React development server can reach this API at `http://localhost:8080`
+through its `/api` proxy. Register and sign in against this local API; the
+separate local database does not contain accounts from the production app.
+
+### Local Silo
+
+```bash
+docker compose up -d --wait --wait-timeout 120 silo
+docker compose --profile setup run --rm silo-init
+```
+
+Silo is a MinIO-compatible S3 server maintained by PGSTY. Compose pins the
+`RELEASE.2026-10-26T00-00-00Z` image, persists data in the existing
+`minio_data` volume, and creates the `sketchflow-assets` bucket automatically.
+Open `http://localhost:9001` and sign in with the local credentials
+`sketchflow` / `local-silo-development-only`. These credentials are for local
+development only. The S3 API is available at `http://localhost:9000`; Cargo-run
+backends use that address, while the Compose backend uses `http://silo:9000`.
+
+### Run directly with Cargo
 
 ```bash
 cp .env.example .env
@@ -30,6 +111,10 @@ cp .env.example .env
 docker run --name sketchflow-db -e POSTGRES_USER=sketchflow \
   -e POSTGRES_PASSWORD=sketchflow -e POSTGRES_DB=sketchflow \
   -p 5432:5432 -d postgres:16
+
+# start Silo and create the configured asset bucket
+docker compose up -d --wait --wait-timeout 120 silo
+docker compose --profile setup run --rm silo-init
 
 # run migrations
 cargo install sqlx-cli --no-default-features --features rustls,postgres
@@ -116,13 +201,15 @@ collaboration operations. Enable collaborative editing only after clients
 write through this backend, or after all legacy write paths have been updated
 to participate in its revision and broadcast flow.
 
-Image and avatar uploads use S3 when `S3_BUCKET` is configured. Set `S3_REGION`
-and optionally `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, and
-`S3_SESSION_TOKEN`; the backend also supports AWS environment credentials and
-the standard AWS credential provider chain (including IAM roles). Without
-`S3_BUCKET`, uploads continue to use local `ASSET_STORAGE_DIR`. S3 uploads
+Image and avatar uploads use S3-compatible storage when `S3_BUCKET` is
+configured. Set `S3_REGION`, credentials, and optionally `S3_ENDPOINT_URL` for
+services such as Silo; custom endpoints use path-style bucket addressing.
+Without `S3_BUCKET`, uploads continue to use local `ASSET_STORAGE_DIR`. Uploads
 store image objects under `assets/` plus JSON metadata sidecars, and the
-existing `GET /api/uploads/{assetId}` endpoint streams the image from S3.
+existing `GET /api/uploads/{assetId}` endpoint streams the image from storage.
+For local development, Compose configures Silo automatically. The Compose
+backend uses `http://silo:9000`; a Cargo-hosted API uses
+`http://localhost:9000` from `.env.example`.
 
 `POST /api/create-order` uses `PAYMENT_GATEWAY` (`razorpay` by default, or
 `paddle`). Razorpay keeps the existing order/verification flow. Paddle returns

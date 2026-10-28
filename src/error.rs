@@ -20,6 +20,8 @@ pub enum AppError {
     NotFound(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("{0}")]
+    PayloadTooLarge(String),
     #[error("{message}")]
     RevisionConflict {
         code: &'static str,
@@ -51,6 +53,7 @@ impl AppError {
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
+            AppError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg.clone()),
             AppError::RevisionConflict { message, .. } => (StatusCode::CONFLICT, message.clone()),
             AppError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
             AppError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
@@ -93,6 +96,17 @@ impl IntoResponse for AppError {
 impl From<sqlx::Error> for AppError {
     fn from(err: sqlx::Error) -> Self {
         AppError::Internal(anyhow::anyhow!(err))
+    }
+}
+
+impl From<axum::extract::multipart::MultipartError> for AppError {
+    fn from(err: axum::extract::multipart::MultipartError) -> Self {
+        let message = err.body_text();
+        if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            AppError::PayloadTooLarge(message)
+        } else {
+            AppError::BadRequest(message)
+        }
     }
 }
 

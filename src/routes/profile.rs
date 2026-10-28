@@ -54,23 +54,13 @@ pub async fn upload_avatar(
 
     let mut file_bytes: Option<Vec<u8>> = None;
     let mut file_mime: Option<String> = None;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|err| AppError::BadRequest(err.to_string()))?
-    {
+    while let Some(field) = multipart.next_field().await? {
         if field.name() == Some("file") {
             file_mime = field
                 .content_type()
                 .map(str::to_string)
                 .or(Some("application/octet-stream".to_string()));
-            file_bytes = Some(
-                field
-                    .bytes()
-                    .await
-                    .map_err(|err| AppError::BadRequest(err.to_string()))?
-                    .to_vec(),
-            );
+            file_bytes = Some(field.bytes().await?.to_vec());
         }
     }
 

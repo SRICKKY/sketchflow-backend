@@ -16,6 +16,7 @@ mod state;
 use std::sync::Arc;
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{get, post},
     Router,
 };
@@ -27,6 +28,9 @@ use tower_http::{
 
 use config::AppConfig;
 use state::AppState;
+
+// Allow the largest accepted file plus multipart fields and framing overhead.
+const MAX_MULTIPART_BODY_BYTES: usize = profile::avatar::AVATAR_MAX_BYTES as usize + 1024 * 1024;
 
 #[tokio::main]
 async fn main() {
@@ -99,9 +103,15 @@ async fn main() {
         .route("/api/paddle/webhook", post(routes::billing::paddle_webhook))
         .route(
             "/api/profile/avatar",
-            post(routes::profile::upload_avatar).delete(routes::profile::delete_avatar),
+            post(routes::profile::upload_avatar)
+                .delete(routes::profile::delete_avatar)
+                .layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
         )
-        .route("/api/uploads", post(routes::uploads::upload_image))
+        .route(
+            "/api/uploads",
+            post(routes::uploads::upload_image)
+                .layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
+        )
         .route("/api/uploads/{asset_id}", get(routes::uploads::get_asset))
         .route(
             "/api/boards/{board_id}/collaboration",
@@ -128,4 +138,74 @@ async fn main() {
         .unwrap_or_else(|e| panic!("failed to bind to {addr}: {e}"));
     tracing::info!("listening on {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.expect("server error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        extract::Multipart,
+        http::{header, Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    async fn consume_multipart(mut multipart: Multipart) -> error::AppResult<StatusCode> {
+        while let Some(field) = multipart.next_field().await? {
+            field.bytes().await?;
+        }
+        Ok(StatusCode::OK)
+    }
+
+    fn multipart_request(file_size: usize) -> Request<Body> {
+        let boundary = "sketchflow-test-boundary";
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"image.png\"\r\nContent-Type: image/png\r\n\r\n"
+        )
+        .into_bytes();
+        body.resize(body.len() + file_size, b'x');
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        Request::builder()
+            .uri("/upload")
+            .method("POST")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn upload_multipart_limit_accepts_supported_file_sizes() {
+        let app = Router::new().route(
+            "/upload",
+            post(consume_multipart).layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
+        );
+
+        let response = app
+            .oneshot(multipart_request(
+                profile::avatar::AVATAR_MAX_BYTES as usize,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn upload_multipart_limit_rejects_oversized_requests_with_413() {
+        let app = Router::new().route(
+            "/upload",
+            post(consume_multipart).layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
+        );
+
+        let response = app
+            .oneshot(multipart_request(MAX_MULTIPART_BODY_BYTES))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
 }

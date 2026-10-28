@@ -84,7 +84,11 @@ async fn s3_client(config: &AppConfig) -> Result<&'static Client, AppError> {
                 ));
             }
             let shared_config = loader.load().await;
-            Ok::<_, AppError>(Client::new(&shared_config))
+            let mut s3_config = aws_sdk_s3::config::Builder::from(&shared_config);
+            if let Some(endpoint_url) = config.s3_endpoint_url.as_deref() {
+                s3_config = s3_config.endpoint_url(endpoint_url).force_path_style(true);
+            }
+            Ok::<_, AppError>(Client::from_conf(s3_config.build()))
         })
         .await
 }
