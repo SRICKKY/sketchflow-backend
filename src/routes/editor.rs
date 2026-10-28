@@ -18,6 +18,7 @@ use crate::{
     error::{AppError, AppResult},
     extract::AppJson,
     routes::collaboration::{self, ElementBatch},
+    routes::notifications::{self, NewNotification, NotificationType},
     state::AppState,
 };
 
@@ -606,18 +607,31 @@ async fn create_comment(
     if !input.x.is_finite() || !input.y.is_finite() {
         return Err(AppError::BadRequest("Invalid comment position.".into()));
     }
+    let mut tx = state.db.begin().await?;
+    let mut recipient_candidates = vec![access.owner_id.clone()];
     if let Some(parent_id) = &input.parent_id {
         let parent = sqlx::query_as::<_, (Option<String>, String)>(
             "SELECT parent_id, board_id FROM board_comments WHERE id = $1",
         )
         .bind(parent_id)
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| AppError::NotFound("Comment thread not found".into()))?;
         if parent.1 != board_id || parent.0.is_some() {
             return Err(AppError::NotFound("Comment thread not found".into()));
         }
+        recipient_candidates = sqlx::query_scalar(
+            "SELECT DISTINCT author_id FROM board_comments
+             WHERE id=$1 OR parent_id=$1 ORDER BY author_id",
+        )
+        .bind(parent_id)
+        .fetch_all(&mut *tx)
+        .await?;
     }
+    let board_name = sqlx::query_scalar::<_, String>("SELECT name FROM boards WHERE id=$1")
+        .bind(&board_id)
+        .fetch_one(&mut *tx)
+        .await?;
     let id = cuid2::create_id();
     let row = sqlx::query_as::<_, CommentRow>(
         "WITH inserted AS (
@@ -635,8 +649,31 @@ async fn create_comment(
     .bind(body)
     .bind(input.x)
     .bind(input.y)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await?;
+    let recipients =
+        notifications::eligible_board_recipients(&mut tx, &board_id, &recipient_candidates).await?;
+    notifications::write(
+        &mut tx,
+        NewNotification {
+            actor_id: user.id.clone(),
+            actor_name: row.3.clone(),
+            recipient_ids: recipients,
+            notification_type: if input.parent_id.is_some() {
+                NotificationType::CommentReply
+            } else {
+                NotificationType::BoardComment
+            },
+            event_key: format!("comment:{}", row.0),
+            board_id: Some(board_id),
+            workspace_id: None,
+            comment_id: Some(row.0.clone()),
+            resource_name: board_name,
+            role: None,
+        },
+    )
+    .await?;
+    tx.commit().await?;
     Ok(Json(comment_from_row(
         row,
         access.role,

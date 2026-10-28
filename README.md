@@ -138,8 +138,19 @@ The server listens on `http://localhost:8080` by default.
 | Billing | `POST /api/create-order`, `POST /api/verify-payment`, `POST /api/paddle/verify-payment`, `POST /api/paddle/webhook` |
 | Profile | `POST /api/profile/avatar`, `DELETE /api/profile/avatar` |
 | Uploads | `POST /api/uploads`, `GET /api/uploads/{assetId}` |
+| Notifications | `GET /api/notifications`, `GET /api/notifications/unread-count`, `PATCH /api/notifications/{notificationId}`, `POST /api/notifications/read-all` |
 | Collaboration | `GET /api/boards/{boardId}/snapshot`, `GET /api/boards/{boardId}/collaboration` (WebSocket) |
 | Invoices | `GET /billing/{invoiceId}/pdf` |
+
+Notification routes require the signed-in `sketchflow_session` cookie and
+return private, non-cacheable responses. The list endpoint accepts
+`filter=all|unread`, `limit=1..50` (default `20`), and an opaque `cursor`;
+it returns `items`, `nextCursor`, `unreadCount`, and `readAllBefore`.
+`PATCH /api/notifications/{notificationId}` marks one accessible notification
+read. `POST /api/notifications/read-all` accepts
+`{"readAllBefore":"<notification-id>"}` and marks only notifications up to
+that stable boundary, leaving newer arrivals unread. Notifications are hidden
+when the recipient no longer has access to their board or workspace.
 
 The collaboration WebSocket requires the existing `sketchflow_session` cookie
 and an `Origin` listed in `CORS_ALLOWED_ORIGINS`. It sends an initial

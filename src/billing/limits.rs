@@ -11,8 +11,13 @@ pub const PRO_MAX_IMAGE_BYTES: i64 = 10 * 1024 * 1024;
 
 pub const IMAGE_COUNT_MESSAGE: &str =
     "Free plan allows 10 images per board. Upgrade to Pro for up to 100.";
-pub const IMAGE_SIZE_MESSAGE: &str =
-    "Free plan allows images up to 5 MB. Upgrade to Pro for 10 MB files.";
+pub fn image_size_message(is_pro: bool) -> &'static str {
+    if is_pro {
+        "This image exceeds the 10 MB limit for the Pro plan."
+    } else {
+        "This image exceeds the 5 MB limit for the Free plan. Upgrade to Pro for uploads up to 10 MB."
+    }
+}
 
 pub fn image_count_cap(is_pro: bool) -> i64 {
     if is_pro {
@@ -27,5 +32,22 @@ pub fn image_byte_cap(is_pro: bool) -> i64 {
         PRO_MAX_IMAGE_BYTES
     } else {
         FREE_MAX_IMAGE_BYTES
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::image_size_message;
+
+    #[test]
+    fn image_size_message_matches_the_plan_limit() {
+        assert_eq!(
+            image_size_message(true),
+            "This image exceeds the 10 MB limit for the Pro plan."
+        );
+        assert_eq!(
+            image_size_message(false),
+            "This image exceeds the 5 MB limit for the Free plan. Upgrade to Pro for uploads up to 10 MB."
+        );
     }
 }

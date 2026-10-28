@@ -19,6 +19,7 @@ use crate::{
     billing::{self, BillingStatus},
     error::{AppError, AppResult},
     extract::AppJson,
+    routes::notifications::{self, NewNotification, NotificationType},
     state::AppState,
 };
 
@@ -1089,6 +1090,21 @@ async fn add_member(
             }
         }
     }
+    let resource_name = if workspace {
+        sqlx::query_scalar::<_, String>("SELECT name FROM workspaces WHERE id=$1")
+            .bind(resource_id)
+            .fetch_one(&mut *tx)
+            .await?
+    } else {
+        sqlx::query_scalar::<_, String>("SELECT name FROM boards WHERE id=$1")
+            .bind(resource_id)
+            .fetch_one(&mut *tx)
+            .await?
+    };
+    let actor_name = sqlx::query_scalar::<_, Option<String>>("SELECT name FROM users WHERE id=$1")
+        .bind(actor_id)
+        .fetch_one(&mut *tx)
+        .await?;
     let member_id = id();
     let sql = if workspace {
         "INSERT INTO workspace_members(id,workspace_id,user_id,role) VALUES($1,$2,$3,$4::workspace_role)"
@@ -1098,10 +1114,34 @@ async fn add_member(
     sqlx::query(sql)
         .bind(&member_id)
         .bind(resource_id)
-        .bind(invitee)
+        .bind(&invitee)
         .bind(role)
         .execute(&mut *tx)
         .await?;
+    notifications::write(
+        &mut tx,
+        NewNotification {
+            actor_id: actor_id.to_string(),
+            actor_name,
+            recipient_ids: vec![invitee],
+            notification_type: if workspace {
+                NotificationType::WorkspaceJoined
+            } else {
+                NotificationType::BoardShared
+            },
+            event_key: if workspace {
+                format!("workspace-joined:{member_id}")
+            } else {
+                format!("board-shared:{member_id}")
+            },
+            board_id: (!workspace).then(|| resource_id.to_string()),
+            workspace_id: workspace.then(|| resource_id.to_string()),
+            comment_id: None,
+            resource_name,
+            role: Some(role.to_string()),
+        },
+    )
+    .await?;
     tx.commit().await?;
     members(&state.db, resource, resource_id)
         .await?
@@ -1154,6 +1194,33 @@ async fn change_member(
             .bind(role)
             .execute(&mut *tx)
             .await?;
+        if !workspace && member.role != role {
+            let board_name = sqlx::query_scalar::<_, String>("SELECT name FROM boards WHERE id=$1")
+                .bind(resource_id)
+                .fetch_one(&mut *tx)
+                .await?;
+            let actor_name =
+                sqlx::query_scalar::<_, Option<String>>("SELECT name FROM users WHERE id=$1")
+                    .bind(actor_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            notifications::write(
+                &mut tx,
+                NewNotification {
+                    actor_id: actor_id.to_string(),
+                    actor_name,
+                    recipient_ids: vec![member.user_id.clone()],
+                    notification_type: NotificationType::BoardRoleChanged,
+                    event_key: format!("board-role:{}", id()),
+                    board_id: Some(resource_id.to_string()),
+                    workspace_id: None,
+                    comment_id: None,
+                    resource_name: board_name,
+                    role: Some(role.to_string()),
+                },
+            )
+            .await?;
+        }
     } else {
         let sql = if workspace {
             "DELETE FROM workspace_members WHERE workspace_id=$1 AND id=$2"
@@ -1163,6 +1230,16 @@ async fn change_member(
         sqlx::query(sql)
             .bind(resource_id)
             .bind(member_id)
+            .execute(&mut *tx)
+            .await?;
+        let notification_sql = if workspace {
+            "DELETE FROM notifications WHERE workspace_id=$1 AND recipient_id=$2"
+        } else {
+            "DELETE FROM notifications WHERE board_id=$1 AND recipient_id=$2"
+        };
+        sqlx::query(notification_sql)
+            .bind(resource_id)
+            .bind(&member.user_id)
             .execute(&mut *tx)
             .await?;
     }
@@ -1285,8 +1362,13 @@ async fn leave_workspace(
     }
 
     sqlx::query("DELETE FROM workspace_members WHERE workspace_id=$1 AND user_id=$2")
-        .bind(workspace_id)
-        .bind(user.id)
+        .bind(&workspace_id)
+        .bind(&user.id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM notifications WHERE workspace_id=$1 AND recipient_id=$2")
+        .bind(&workspace_id)
+        .bind(&user.id)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;

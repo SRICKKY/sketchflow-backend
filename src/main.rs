@@ -128,6 +128,7 @@ async fn main() {
         .merge(openapi::swagger_ui())
         .merge(routes::dashboard::router())
         .merge(routes::editor::router())
+        .merge(routes::notifications::router())
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .layer(CookieManagerLayer::new())

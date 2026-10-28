@@ -16,7 +16,7 @@ use crate::{
 
 const ALLOWED_MIME_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 /// Maximum image payload accepted by this API, for both disk and S3 storage.
-const INFRA_MAX_BYTES: i64 = 8 * 1024 * 1024;
+const INFRA_MAX_BYTES: i64 = limits::PRO_MAX_IMAGE_BYTES;
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct UploadResponse {
@@ -101,7 +101,7 @@ pub async fn upload_image(
     let byte_len = buffer.len() as i64;
     if byte_len > max_bytes {
         let message = if byte_len > plan_max {
-            limits::IMAGE_SIZE_MESSAGE
+            limits::image_size_message(is_pro)
         } else {
             "Image is too large"
         };
