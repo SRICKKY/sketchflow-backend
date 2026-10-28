@@ -15,9 +15,7 @@ use crate::{
 };
 
 const ALLOWED_MIME_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
-/// Matches the Next.js app's `usesRemoteAssetStorage()` ? 4.5MB : 8MB infra
-/// ceiling; this backend always stores on local disk, so the larger bound
-/// applies.
+/// Maximum image payload accepted by this API, for both disk and S3 storage.
 const INFRA_MAX_BYTES: i64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -65,19 +63,10 @@ pub async fn upload_image(
     let mut file_bytes: Option<Vec<u8>> = None;
     let mut file_mime: Option<String> = None;
 
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|err| AppError::BadRequest(err.to_string()))?
-    {
+    while let Some(field) = multipart.next_field().await? {
         match field.name().map(str::to_string).as_deref() {
             Some("boardId") => {
-                board_id = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|err| AppError::BadRequest(err.to_string()))?,
-                );
+                board_id = Some(field.text().await?);
             }
             Some("width") => {
                 width = field.text().await.ok().and_then(|v| v.parse::<i32>().ok());
@@ -87,13 +76,7 @@ pub async fn upload_image(
             }
             Some("file") => {
                 file_mime = field.content_type().map(str::to_string);
-                file_bytes = Some(
-                    field
-                        .bytes()
-                        .await
-                        .map_err(|err| AppError::BadRequest(err.to_string()))?
-                        .to_vec(),
-                );
+                file_bytes = Some(field.bytes().await?.to_vec());
             }
             _ => {}
         }
