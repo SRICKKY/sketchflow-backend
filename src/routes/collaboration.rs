@@ -12,11 +12,11 @@ use axum::{
     response::Response,
     Json,
 };
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use redis::{aio::ConnectionManager, AsyncCommands, Client as RedisClient};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::time::{Duration, Instant};
 use tower_cookies::Cookies;
 
@@ -225,6 +225,8 @@ enum ClientMessage {
         #[serde(default, rename = "selectedIds")]
         selected_ids: Vec<String>,
     },
+    /// Broadcasts a temporary canvas state without persisting it.
+    Preview { sequence: u64, batch: ElementBatch },
     /// Answers the application-level heartbeat without changing board state.
     Ping,
 }
@@ -262,6 +264,13 @@ enum ServerMessage {
         revision: i64,
         client_operation_id: String,
         actor_id: String,
+        batch: ElementBatch,
+    },
+    /// Relays a temporary canvas state to peers without changing the document.
+    PreviewUpdated {
+        connection_id: String,
+        user_id: String,
+        sequence: u64,
         batch: ElementBatch,
     },
     /// Announces a newly connected participant.
@@ -439,18 +448,32 @@ async fn handle_socket(
     )
     .await;
 
+    let (mut socket_sender, mut socket_receiver) = socket.split();
+    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Message>(64);
+    let writer_task = tokio::spawn(async move {
+        while let Some(message) = outgoing_rx.recv().await {
+            if socket_sender.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
+
     let mut rate_window = Instant::now();
     let mut messages_in_window = 0;
+    let mut last_activity = Instant::now();
+    let mut heartbeat_check = tokio::time::interval(Duration::from_secs(15));
+    heartbeat_check.tick().await;
     // Refresh membership so removed or downgraded users lose access on open sockets.
     let mut authorization_check = tokio::time::interval(Duration::from_secs(30));
     authorization_check.tick().await;
 
     loop {
         tokio::select! {
-            incoming = socket.recv() => {
+            incoming = socket_receiver.next() => {
                 let Some(Ok(message)) = incoming else {
                     break;
                 };
+                last_activity = Instant::now();
                 match message {
                     Message::Text(text) => {
                         let now = Instant::now();
@@ -460,18 +483,18 @@ async fn handle_socket(
                         }
                         messages_in_window += 1;
                         if messages_in_window > MAX_MESSAGES_PER_SECOND {
-                            let _ = send_message(&mut socket, &ServerMessage::Error {
+                            let _ = queue_message(&outgoing_tx, &ServerMessage::Error {
                                 message: "Too many collaboration messages.".to_string(),
-                            }).await;
+                            });
                             break;
                         }
 
                         let envelope = match serde_json::from_str::<Value>(text.as_str()) {
                             Ok(value) => value,
                             Err(_) => {
-                                if send_message(&mut socket, &ServerMessage::Error {
+                                if !queue_message(&outgoing_tx, &ServerMessage::Error {
                                     message: "Invalid collaboration message.".to_string(),
-                                }).await.is_err() {
+                                }) {
                                     break;
                                 }
                                 continue;
@@ -482,9 +505,9 @@ async fn handle_socket(
                             .and_then(Value::as_u64)
                             != Some(PROTOCOL_VERSION)
                         {
-                            if send_message(&mut socket, &ServerMessage::Error {
+                            if !queue_message(&outgoing_tx, &ServerMessage::Error {
                                 message: "Unsupported collaboration protocol version.".to_string(),
-                            }).await.is_err() {
+                            }) {
                                 break;
                             }
                             continue;
@@ -493,9 +516,9 @@ async fn handle_socket(
                         let client_message = match serde_json::from_value::<ClientMessage>(envelope) {
                             Ok(message) => message,
                             Err(_) => {
-                                if send_message(&mut socket, &ServerMessage::Error {
+                                if !queue_message(&outgoing_tx, &ServerMessage::Error {
                                     message: "Invalid collaboration message.".to_string(),
-                                }).await.is_err() {
+                                }) {
                                     break;
                                 }
                                 continue;
@@ -505,9 +528,9 @@ async fn handle_socket(
                             ClientMessage::ApplyOperation { client_operation_id, base_revision, batch } => {
                                 // Reject viewers early, then re-check database authorization before each write.
                                 if role < BoardRole::Editor {
-                                    if send_message(&mut socket, &ServerMessage::Error {
+                                    if !queue_message(&outgoing_tx, &ServerMessage::Error {
                                         message: "You do not have permission to edit this board.".to_string(),
-                                    }).await.is_err() {
+                                    }) {
                                         break;
                                     }
                                     continue;
@@ -552,9 +575,41 @@ async fn handle_socket(
                                         },
                                     ).await,
                                     Err(error) => {
-                                        if send_message(&mut socket, &ServerMessage::Error {
+                                        if !queue_message(&outgoing_tx, &ServerMessage::Error {
                                             message: error.to_string(),
-                                        }).await.is_err() {
+                                        }) {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            ClientMessage::Preview { sequence, batch } => {
+                                if role < BoardRole::Editor {
+                                    let _ = queue_message(
+                                        &outgoing_tx,
+                                        &ServerMessage::Error {
+                                            message: "You do not have permission to publish previews."
+                                                .to_string(),
+                                        },
+                                    );
+                                    break;
+                                }
+                                match validate_preview(batch) {
+                                    Ok(batch) => publish_message(
+                                        &state.collaboration,
+                                        &board_id,
+                                        &room_tx,
+                                        &ServerMessage::PreviewUpdated {
+                                            connection_id: connection_id.clone(),
+                                            user_id: user.id.clone(),
+                                            sequence,
+                                            batch,
+                                        },
+                                    ).await,
+                                    Err(error) => {
+                                        if !queue_message(&outgoing_tx, &ServerMessage::Error {
+                                            message: error.to_string(),
+                                        }) {
                                             break;
                                         }
                                     }
@@ -574,31 +629,31 @@ async fn handle_socket(
                                         },
                                     ).await,
                                     Err(error) => {
-                                        if send_message(&mut socket, &ServerMessage::Error {
+                                        if !queue_message(&outgoing_tx, &ServerMessage::Error {
                                             message: error.to_string(),
-                                        }).await.is_err() {
+                                        }) {
                                             break;
                                         }
                                     }
                                 }
                             }
                             ClientMessage::Ping => {
-                                if send_message(&mut socket, &ServerMessage::Pong).await.is_err() {
+                                if !queue_message(&outgoing_tx, &ServerMessage::Pong) {
                                     break;
                                 }
                             }
                         }
                     }
                     Message::Ping(payload) => {
-                        if socket.send(Message::Pong(payload)).await.is_err() {
+                        if outgoing_tx.try_send(Message::Pong(payload)).is_err() {
                             break;
                         }
                     }
                     Message::Close(_) => break,
                     Message::Binary(_) => {
-                        if send_message(&mut socket, &ServerMessage::Error {
+                        if !queue_message(&outgoing_tx, &ServerMessage::Error {
                             message: "Binary collaboration messages are not supported.".to_string(),
-                        }).await.is_err() {
+                        }) {
                             break;
                         }
                     }
@@ -620,16 +675,25 @@ async fn handle_socket(
                     }
                 }
             }
+            _ = heartbeat_check.tick() => {
+                if last_activity.elapsed() > Duration::from_secs(60) {
+                    tracing::info!(board_id, user_id = %user.id, "closing inactive collaboration connection");
+                    break;
+                }
+            }
             outgoing = room_rx.recv() => {
                 match outgoing {
                     Ok(text) => {
-                        if socket.send(Message::Text(text.into())).await.is_err() {
+                        if outgoing_tx
+                            .try_send(Message::Text(text.into()))
+                            .is_err()
+                        {
                             break;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         // A slow socket may have missed events; disconnect it so it can resync.
-                        let _ = send_message(&mut socket, &ServerMessage::ResyncRequired).await;
+                        let _ = queue_message(&outgoing_tx, &ServerMessage::ResyncRequired);
                         break;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -648,6 +712,9 @@ async fn handle_socket(
         },
     )
     .await;
+    drop(outgoing_tx);
+    writer_task.abort();
+    let _ = writer_task.await;
     // Broadcast departure before releasing the room receiver and its resources.
     drop(room_rx);
     state
@@ -715,6 +782,13 @@ pub(super) fn validate_operation(
         }
     }
     Ok(batch)
+}
+
+fn validate_preview(batch: ElementBatch) -> AppResult<ElementBatch> {
+    if batch.upserts.is_empty() && batch.deleted_ids.is_empty() {
+        return Ok(batch);
+    }
+    validate_operation("preview", batch)
 }
 
 /// Checks transient cursor and selection values before they are broadcast.
@@ -836,6 +910,13 @@ async fn send_message(socket: &mut WebSocket, message: &ServerMessage) -> Result
     socket.send(Message::Text(json.into())).await
 }
 
+/// Queues a protocol message without blocking the connection's read loop.
+fn queue_message(sender: &mpsc::Sender<Message>, message: &ServerMessage) -> bool {
+    sender
+        .try_send(Message::Text(serialize_server_message(message).into()))
+        .is_ok()
+}
+
 /// Fans an event out locally or through Redis, asking local clients to resync on failure.
 async fn publish_message(
     hub: &CollaborationHub,
@@ -938,6 +1019,29 @@ mod tests {
     }
 
     #[test]
+    fn validates_ephemeral_preview_batches_without_document_operation_ids() {
+        let message = serde_json::from_value::<ClientMessage>(json!({
+            "type": "preview",
+            "sequence": 3,
+            "batch": {
+                "upserts": [element("el-1", "rectangle")],
+                "deletedIds": []
+            }
+        }))
+        .unwrap();
+        let ClientMessage::Preview { sequence, batch } = message else {
+            panic!("expected preview request");
+        };
+        assert_eq!(sequence, 3);
+        assert!(validate_operation("preview", batch).is_ok());
+        assert!(validate_preview(ElementBatch {
+            upserts: vec![],
+            deleted_ids: vec![],
+        })
+        .is_ok());
+    }
+
+    #[test]
     fn includes_protocol_version_in_server_envelopes() {
         let message = serialize_server_message(&ServerMessage::Pong);
         let envelope: Value = serde_json::from_str(&message).unwrap();
@@ -962,5 +1066,21 @@ mod tests {
     #[test]
     fn redis_client_accepts_tls_urls_without_connecting() {
         assert!(RedisClient::open("rediss://example.invalid:6379").is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_slow_room_consumer_does_not_block_healthy_consumers() {
+        let hub = CollaborationHub::default();
+        let (sender, mut slow) = hub.subscribe("board-1").await;
+        let (_, mut healthy) = hub.subscribe("board-1").await;
+
+        for sequence in 0..=ROOM_CAPACITY {
+            sender.send(sequence.to_string()).unwrap();
+            assert_eq!(healthy.recv().await.unwrap(), sequence.to_string());
+        }
+        assert!(matches!(
+            slow.recv().await,
+            Err(broadcast::error::RecvError::Lagged(_))
+        ));
     }
 }

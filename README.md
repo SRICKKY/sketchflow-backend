@@ -162,7 +162,13 @@ assigns its board revision, and broadcasts `operation_applied` to the board.
 Retries with the same actor and operation ID are idempotent while the
 operation remains in the latest 1,000-operation history for that board. A
 client can send `presence` messages containing a cursor and selected element
-IDs; those events are transient and are never stored.
+IDs; those events are transient and are never stored. Editors can also send
+`preview` messages with a monotonically increasing connection-local sequence
+and an incremental element batch. Preview batches are bounded to 500 upserts
+and 500 deletions, are broadcast without database writes, and are replaced by
+the next preview from that connection. An empty preview batch clears its
+current preview. Committed operations remain the only source of persisted
+document state.
 
 The WebSocket message shapes are:
 
@@ -172,6 +178,8 @@ The WebSocket message shapes are:
 | Server | `snapshot` | `boardId`, `revision`, `elements` |
 | Client | `apply_operation` | `clientOperationId`, `batch: { upserts, deletedIds }` |
 | Server | `operation_applied` | `revision`, `clientOperationId`, `actorId`, `batch` |
+| Client | `preview` | `sequence`, `batch: { upserts, deletedIds }` |
+| Server | `preview_updated` | `connectionId`, `userId`, `sequence`, `batch` |
 | Client | `presence` | optional `cursor: { x, y }`, `selectedIds` |
 | Server | `presence_joined` | `connectionId`, `userId`, `name`, `image` |
 | Server | `presence_updated` | `connectionId`, `userId`, `cursor`, `selectedIds` |
@@ -191,8 +199,10 @@ All client messages include `protocolVersion: 1`. For example:
   "selectedIds": ["element-id"]
 }
 ```
-Connections are limited to 60 JSON messages per second and 1 MiB per message;
-board access is periodically revalidated while the socket remains open.
+Connections are limited to 60 JSON messages per second and 1 MiB per message.
+The client sends application heartbeats every 20 seconds; the server closes
+connections with no inbound activity for 60 seconds so presence is cleaned up.
+Board access is periodically revalidated while the socket remains open.
 
 Owners and editors can submit document changes. Viewers can receive snapshots
 and presence but cannot edit. Simultaneous edits are ordered by the backend;
