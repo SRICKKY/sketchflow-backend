@@ -26,16 +26,20 @@ pub struct PublicUser {
     pub email: String,
     pub image: Option<String>,
     pub plan: String,
+    #[serde(rename = "hasPassword")]
+    pub has_password: bool,
 }
 
 impl From<User> for PublicUser {
     fn from(user: User) -> Self {
+        let has_password = user.password_hash.is_some();
         Self {
             id: user.id,
             name: user.name,
             email: user.email,
             image: user.image,
             plan: user.plan,
+            has_password,
         }
     }
 }
