@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::DefaultBodyLimit,
-    routing::{get, post},
+    routing::{get, patch, post},
     Router,
 };
 use tower_cookies::CookieManagerLayer;
@@ -94,6 +94,11 @@ async fn main() {
         .route("/api/auth/login", post(routes::auth::login))
         .route("/api/auth/logout", post(routes::auth::logout))
         .route("/api/auth/session", get(routes::auth::get_session))
+        .route("/api/profile", patch(routes::profile::update_profile_name))
+        .route(
+            "/api/profile/password",
+            patch(routes::profile::update_profile_password),
+        )
         .route("/api/create-order", post(routes::billing::create_order))
         .route("/api/verify-payment", post(routes::billing::verify_payment))
         .route(
