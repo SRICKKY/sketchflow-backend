@@ -107,7 +107,10 @@ async fn editor_http_flows_and_revision_checks() {
         config: Arc::new(config),
         collaboration: crate::routes::collaboration::CollaborationHub::default(),
     };
-    let app = router().layer(CookieManagerLayer::new()).with_state(state);
+    let app = router()
+        .merge(crate::routes::notifications::router())
+        .layer(CookieManagerLayer::new())
+        .with_state(state);
     for (id, email) in [
         ("editor_owner", "owner@test.invalid"),
         ("editor_viewer", "viewer@test.invalid"),
@@ -295,7 +298,7 @@ async fn editor_http_flows_and_revision_checks() {
 
     let (status, reactions) = request(
         &app,
-        Some(&owner),
+        Some(&viewer),
         "POST",
         &format!("{board}/comments/{comment_id}/reactions"),
         Some(json!({"emoji": "👍"})),
@@ -304,6 +307,14 @@ async fn editor_http_flows_and_revision_checks() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(reactions[0]["count"], 1);
     assert_eq!(reactions[0]["reactedByMe"], true);
+    let (status, notifications) =
+        request(&app, Some(&owner), "GET", "/api/notifications", None).await;
+    assert_eq!(status, StatusCode::OK, "{notifications}");
+    assert_eq!(notifications["items"][0]["type"], "COMMENT_REACTION");
+    assert_eq!(
+        notifications["items"][0]["href"],
+        format!("/board/editor-board?comment={comment_id}")
+    );
 
     let (status, comments) = request(
         &app,
