@@ -139,6 +139,25 @@ impl CollaborationHub {
         }
     }
 
+    /// Notifies connected clients on every instance that a user's board access was revoked.
+    pub async fn revoke_board_access(&self, board_id: &str, user_id: &str) {
+        let message = serialize_server_message(&ServerMessage::AccessRevoked {
+            user_id: user_id.to_string(),
+            message: "Your permission to view this canvas has been revoked.".to_string(),
+        });
+        let room = self.room(board_id).await;
+        if self.redis_publisher.is_none() {
+            let _ = room.send(message);
+        } else if let Err(error) = self.publish(board_id, message.clone()).await {
+            tracing::error!(
+                board_id,
+                %error,
+                "failed to publish board access revocation to Redis"
+            );
+            let _ = room.send(message);
+        }
+    }
+
     /// Tells local clients to reload a snapshot after this instance may have missed events.
     async fn require_local_resync(&self) {
         let rooms = self.rooms.lock().await;
@@ -292,6 +311,8 @@ enum ServerMessage {
         connection_id: String,
         user_id: String,
     },
+    /// Removes a participant from a board immediately after access is revoked.
+    AccessRevoked { user_id: String, message: String },
     /// Response to a client heartbeat.
     Pong,
     /// Reports a rejected request or protocol problem.
@@ -1047,6 +1068,34 @@ mod tests {
         let envelope: Value = serde_json::from_str(&message).unwrap();
         assert_eq!(envelope["type"], "pong");
         assert_eq!(envelope["protocolVersion"], PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn serializes_targeted_access_revocation_events() {
+        let message = serialize_server_message(&ServerMessage::AccessRevoked {
+            user_id: "user-1".to_string(),
+            message: "Your permission to view this canvas has been revoked.".to_string(),
+        });
+        let envelope: Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(envelope["type"], "access_revoked");
+        assert_eq!(envelope["userId"], "user-1");
+        assert_eq!(
+            envelope["message"],
+            "Your permission to view this canvas has been revoked."
+        );
+        assert_eq!(envelope["protocolVersion"], PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn broadcasts_access_revocation_to_board_connections() {
+        let hub = CollaborationHub::default();
+        let (_, mut receiver) = hub.subscribe("board-1").await;
+
+        hub.revoke_board_access("board-1", "user-1").await;
+
+        let message: Value = serde_json::from_str(&receiver.recv().await.unwrap()).unwrap();
+        assert_eq!(message["type"], "access_revoked");
+        assert_eq!(message["userId"], "user-1");
     }
 
     #[test]
