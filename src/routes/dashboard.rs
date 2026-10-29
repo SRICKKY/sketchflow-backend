@@ -1179,6 +1179,26 @@ async fn change_member(
             "The owner cannot be removed or have their role changed.".into(),
         ));
     }
+    let revoked_board_ids = if new_role.is_none() {
+        if workspace {
+            sqlx::query_scalar::<_, String>(
+                "SELECT b.id FROM boards b
+                 WHERE b.workspace_id=$1 AND b.owner_id<>$2
+                   AND NOT EXISTS (
+                       SELECT 1 FROM board_members bm
+                       WHERE bm.board_id=b.id AND bm.user_id=$2
+                   )",
+            )
+            .bind(resource_id)
+            .bind(&member.user_id)
+            .fetch_all(&mut *tx)
+            .await?
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
     if let Some(role) = new_role {
         if workspace {
             require_pro(&state.db, &member.user_id).await?;
@@ -1244,6 +1264,12 @@ async fn change_member(
             .await?;
     }
     tx.commit().await?;
+    for board_id in revoked_board_ids {
+        state
+            .collaboration
+            .revoke_board_access(&board_id, &member.user_id)
+            .await;
+    }
     Ok(new_role.map(|role| Member {
         role: role.into(),
         ..member
@@ -1360,6 +1386,18 @@ async fn leave_workspace(
             "The owner must delete the workspace instead of leaving.".into(),
         ));
     }
+    let revoked_board_ids = sqlx::query_scalar::<_, String>(
+        "SELECT b.id FROM boards b
+         WHERE b.workspace_id=$1 AND b.owner_id<>$2
+           AND NOT EXISTS (
+               SELECT 1 FROM board_members bm
+               WHERE bm.board_id=b.id AND bm.user_id=$2
+           )",
+    )
+    .bind(&workspace_id)
+    .bind(&user.id)
+    .fetch_all(&mut *tx)
+    .await?;
 
     sqlx::query("DELETE FROM workspace_members WHERE workspace_id=$1 AND user_id=$2")
         .bind(&workspace_id)
@@ -1372,6 +1410,12 @@ async fn leave_workspace(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    for board_id in revoked_board_ids {
+        state
+            .collaboration
+            .revoke_board_access(&board_id, &user.id)
+            .await;
+    }
     Ok(Json(json!({"success":true})))
 }
 

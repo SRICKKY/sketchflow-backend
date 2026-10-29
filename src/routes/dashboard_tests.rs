@@ -157,6 +157,7 @@ async fn dashboard_http_flows_and_authorization() {
         collaboration: super::super::collaboration::CollaborationHub::default(),
     };
     let app = router()
+        .merge(super::super::editor::router())
         .route(
             "/api/boards/{board_id}/snapshot",
             get(super::super::collaboration::snapshot),
@@ -807,6 +808,34 @@ async fn dashboard_http_flows_and_authorization() {
     .await;
     let team_board=request(&app,Some(&member_token),"POST","/api/boards",Some(json!({"name":"Team board","workspaceId":workspace_id,"templateId":"builtin:flowchart"})),201).await;
     let team_board_id = team_board["id"].as_str().unwrap();
+    let workspace_access_board = request(
+        &app,
+        Some(&pro),
+        "POST",
+        "/api/boards",
+        Some(json!({"name":"Workspace access board","workspaceId":workspace_id})),
+        201,
+    )
+    .await;
+    let workspace_access_board_id = workspace_access_board["id"].as_str().unwrap();
+    request(
+        &app,
+        Some(&member_token),
+        "GET",
+        &format!("/api/boards/{workspace_access_board_id}/detail"),
+        None,
+        200,
+    )
+    .await;
+    request(
+        &app,
+        Some(&admin_token),
+        "GET",
+        &format!("/api/boards/{workspace_access_board_id}/detail"),
+        None,
+        200,
+    )
+    .await;
     let team_list = request(
         &app,
         Some(&pro),
@@ -881,11 +910,29 @@ async fn dashboard_http_flows_and_authorization() {
     request(&app, Some(&member_token), "GET", &wp, None, 404).await;
     request(
         &app,
+        Some(&member_token),
+        "GET",
+        &format!("/api/boards/{workspace_access_board_id}/detail"),
+        None,
+        404,
+    )
+    .await;
+    request(
+        &app,
         Some(&pro),
         "DELETE",
         &format!("{wp}/members/{}", admin_member["id"].as_str().unwrap()),
         None,
         200,
+    )
+    .await;
+    request(
+        &app,
+        Some(&admin_token),
+        "GET",
+        &format!("/api/boards/{workspace_access_board_id}/detail"),
+        None,
+        404,
     )
     .await;
     request(&app, Some(&admin_token), "GET", &wp, None, 404).await;
