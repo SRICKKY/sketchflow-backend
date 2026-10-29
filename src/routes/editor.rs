@@ -789,42 +789,68 @@ async fn toggle_reaction(
     if !COMMENT_EMOJIS.contains(&input.emoji.as_str()) {
         return Err(AppError::BadRequest("Invalid reaction.".into()));
     }
-    let exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM board_comments WHERE id = $1 AND board_id = $2)",
+    let mut tx = state.db.begin().await?;
+    let comment = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT c.author_id, b.name, actor.name
+         FROM board_comments c
+         JOIN boards b ON b.id = c.board_id
+         JOIN users actor ON actor.id = $3
+         WHERE c.id = $1 AND c.board_id = $2
+         FOR UPDATE OF c",
     )
     .bind(&comment_id)
     .bind(&board_id)
-    .fetch_one(&state.db)
-    .await?;
-    if !exists {
-        return Err(AppError::NotFound("Comment not found".into()));
-    }
-    let inserted = sqlx::query(
+    .bind(&user.id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::NotFound("Comment not found".into()))?;
+    let reaction_id = sqlx::query_scalar::<_, String>(
         "INSERT INTO comment_reactions (id, comment_id, user_id, emoji)
          VALUES ($1, $2, $3, $4)
-         ON CONFLICT (comment_id, user_id, emoji) DO NOTHING",
+         ON CONFLICT (comment_id, user_id, emoji) DO NOTHING
+         RETURNING id",
     )
     .bind(cuid2::create_id())
     .bind(&comment_id)
     .bind(&user.id)
     .bind(&input.emoji)
-    .execute(&state.db)
+    .fetch_optional(&mut *tx)
     .await?;
-    if inserted.rows_affected() == 0 {
+    if let Some(reaction_id) = reaction_id {
+        let recipients =
+            notifications::eligible_board_recipients(&mut tx, &board_id, &[comment.0.clone()])
+                .await?;
+        notifications::write(
+            &mut tx,
+            NewNotification {
+                actor_id: user.id.clone(),
+                actor_name: comment.2,
+                recipient_ids: recipients,
+                notification_type: NotificationType::CommentReaction,
+                event_key: format!("comment-reaction:{reaction_id}"),
+                board_id: Some(board_id.clone()),
+                workspace_id: None,
+                comment_id: Some(comment_id.clone()),
+                resource_name: comment.1,
+                role: None,
+            },
+        )
+        .await?;
+    } else {
         sqlx::query(
             "DELETE FROM comment_reactions WHERE comment_id=$1 AND user_id=$2 AND emoji=$3",
         )
         .bind(&comment_id)
         .bind(&user.id)
         .bind(&input.emoji)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
     }
     let reactions = sqlx::query_as::<_, (String, String)>(
         "SELECT emoji, user_id FROM comment_reactions WHERE comment_id=$1",
     )
     .bind(&comment_id)
-    .fetch_all(&state.db)
+    .fetch_all(&mut *tx)
     .await?;
     let mut summary: HashMap<String, (usize, bool)> = HashMap::new();
     for (emoji, user_id) in reactions {
@@ -832,7 +858,7 @@ async fn toggle_reaction(
         entry.0 += 1;
         entry.1 |= user_id == user.id;
     }
-    Ok(Json(
+    let summary = Json(
         summary
             .into_iter()
             .map(|(emoji, (count, reacted_by_me))| CommentReactionSummary {
@@ -841,7 +867,9 @@ async fn toggle_reaction(
                 reacted_by_me,
             })
             .collect(),
-    ))
+    );
+    tx.commit().await?;
+    Ok(summary)
 }
 
 fn comment_from_row(

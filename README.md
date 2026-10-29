@@ -151,6 +151,9 @@ read. `POST /api/notifications/read-all` accepts
 `{"readAllBefore":"<notification-id>"}` and marks only notifications up to
 that stable boundary, leaving newer arrivals unread. Notifications are hidden
 when the recipient no longer has access to their board or workspace.
+Board comments notify the board owner, replies notify the root author and
+previous thread participants, and newly added comment reactions notify the
+comment author. Removing a reaction does not create a notification.
 
 The collaboration WebSocket requires the existing `sketchflow_session` cookie
 and an `Origin` listed in `CORS_ALLOWED_ORIGINS`. It sends an initial

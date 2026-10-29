@@ -79,6 +79,7 @@ pub enum NotificationType {
     WorkspaceJoined,
     BoardComment,
     CommentReply,
+    CommentReaction,
 }
 
 impl NotificationType {
@@ -89,6 +90,7 @@ impl NotificationType {
             Self::WorkspaceJoined => "WORKSPACE_JOINED",
             Self::BoardComment => "BOARD_COMMENT",
             Self::CommentReply => "COMMENT_REPLY",
+            Self::CommentReaction => "COMMENT_REACTION",
         }
     }
 
@@ -99,6 +101,7 @@ impl NotificationType {
             "WORKSPACE_JOINED" => Ok(Self::WorkspaceJoined),
             "BOARD_COMMENT" => Ok(Self::BoardComment),
             "COMMENT_REPLY" => Ok(Self::CommentReply),
+            "COMMENT_REACTION" => Ok(Self::CommentReaction),
             _ => Err(AppError::Internal(anyhow::anyhow!(
                 "unknown persisted notification type"
             ))),
@@ -297,6 +300,9 @@ impl NotificationRow {
             NotificationType::BoardComment => format!("{actor} commented on {resource}."),
             NotificationType::CommentReply => {
                 format!("{actor} replied to a thread on {resource}.")
+            }
+            NotificationType::CommentReaction => {
+                format!("{actor} reacted to your comment on {resource}.")
             }
         };
         let href = if let Some(board_id) = self.board_id {
@@ -858,6 +864,18 @@ mod tests {
         assert_eq!(item.message, "Ada commented on Ideas.");
         assert_eq!(item.href, "/board/board%201?comment=comment%3F1");
         assert_eq!(item.r#type, NotificationType::BoardComment);
+    }
+
+    #[test]
+    fn serializes_comment_reaction_notifications() {
+        let item = row(
+            "COMMENT_REACTION",
+            json!({"actorName":"Ada","resourceName":"Ideas"}),
+        )
+        .serialize()
+        .unwrap();
+        assert_eq!(item.message, "Ada reacted to your comment on Ideas.");
+        assert_eq!(item.r#type, NotificationType::CommentReaction);
     }
 
     #[test]
