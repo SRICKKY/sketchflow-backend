@@ -84,6 +84,9 @@ command again to rebuild and restart the API.
 The React development server can reach this API at `http://localhost:8080`
 through its `/api` proxy. Register and sign in against this local API; the
 separate local database does not contain accounts from the production app.
+Expo web origins at `http://localhost:8081` and `http://localhost:8082` are
+also allowed for local development. If the frontend uses a different origin,
+add that exact origin to `CORS_ALLOWED_ORIGINS` and restart the backend.
 
 ### Local Silo
 

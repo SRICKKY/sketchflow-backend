@@ -54,11 +54,14 @@ impl AppConfig {
         // real environment variables are used instead).
         let _ = dotenvy::dotenv();
 
-        let cors_allowed_origins = env_var("CORS_ALLOWED_ORIGINS", "http://localhost:3000")
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let cors_allowed_origins = env_var(
+            "CORS_ALLOWED_ORIGINS",
+            "http://localhost:3000,http://localhost:8081,http://localhost:8082",
+        )
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
         Self {
             host: env_var("HOST", "0.0.0.0"),
