@@ -10,7 +10,7 @@ use crate::{
     auth::session,
     billing::{
         self, activate_pro_subscription, get_billing_state, quote_checkout, razorpay,
-        BillingInterval,
+        BillingInterval, BillingStatus,
     },
     error::{AppError, AppResult},
     extract::AppJson,
@@ -41,6 +41,102 @@ pub struct CreateOrderResponse {
     pub client_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct AnnualUpgradeQuoteResponse {
+    pub eligible: bool,
+    #[serde(rename = "currentInterval")]
+    pub current_interval: Option<String>,
+    #[serde(rename = "currentExpiresAt")]
+    pub current_expires_at: Option<String>,
+    #[serde(rename = "annualPriceMinor")]
+    pub annual_price_minor: Option<i64>,
+    #[serde(rename = "unusedCreditMinor")]
+    pub unused_credit_minor: Option<i64>,
+    #[serde(rename = "amountDueMinor")]
+    pub amount_due_minor: Option<i64>,
+    pub currency: Option<String>,
+}
+
+/// Return an exact, read-only quote for an active monthly Pro user's annual upgrade.
+#[utoipa::path(
+    get,
+    path = "/api/billing/annual-upgrade-quote",
+    tag = "billing",
+    responses(
+        (status = 200, description = "Annual upgrade quote or an ineligible result", body = AnnualUpgradeQuoteResponse),
+        (status = 401, description = "Not signed in"),
+        (status = 503, description = "Annual plan pricing is invalid")
+    )
+)]
+pub async fn annual_upgrade_quote(
+    State(state): State<AppState>,
+    cookies: Cookies,
+) -> AppResult<Json<AnnualUpgradeQuoteResponse>> {
+    let user = session::optional_current_user(&cookies, &state)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("Sign in to view upgrade pricing.".to_string()))?;
+    let billing_state = get_billing_state(&state.db, &user.id).await?;
+    let current_interval = billing_state
+        .interval
+        .map(|value| value.as_str().to_string());
+    let current_expires_at = billing_state.expires_at.map(|value| value.to_rfc3339());
+
+    if billing_state.status != BillingStatus::Active
+        || billing_state.interval != Some(BillingInterval::Month)
+    {
+        return Ok(Json(AnnualUpgradeQuoteResponse {
+            eligible: false,
+            current_interval,
+            current_expires_at,
+            annual_price_minor: None,
+            unused_credit_minor: None,
+            amount_due_minor: None,
+            currency: None,
+        }));
+    }
+
+    let quote = quote_checkout(
+        &state.config,
+        BillingInterval::Year,
+        &billing_state,
+        Utc::now(),
+    );
+    if quote.blocked {
+        return Err(AppError::Conflict(
+            quote
+                .blocked_message
+                .unwrap_or_else(|| "Annual upgrade is unavailable.".to_string()),
+        ));
+    }
+
+    let annual_price_minor = billing::paddle::checkout_amount_to_paddle_minor(
+        billing::checkout_amount_minor(&state.config, BillingInterval::Year),
+    )
+    .ok_or_else(|| {
+        AppError::ServiceUnavailable("Annual Pro price is not configured.".to_string())
+    })?;
+    let amount_due_minor = billing::paddle::checkout_amount_to_paddle_minor(quote.amount_minor)
+        .ok_or_else(|| {
+            AppError::ServiceUnavailable("Annual upgrade amount is invalid.".to_string())
+        })?;
+    let unused_credit_minor = annual_price_minor
+        .checked_sub(amount_due_minor)
+        .filter(|credit| *credit >= 0)
+        .ok_or_else(|| {
+            AppError::ServiceUnavailable("Annual upgrade quote is inconsistent.".to_string())
+        })?;
+
+    Ok(Json(AnnualUpgradeQuoteResponse {
+        eligible: true,
+        current_interval,
+        current_expires_at,
+        annual_price_minor: Some(annual_price_minor),
+        unused_credit_minor: Some(unused_credit_minor),
+        amount_due_minor: Some(amount_due_minor),
+        currency: Some("USD".to_string()),
+    }))
 }
 
 /// Create a payment checkout for the signed-in user to upgrade to Pro.

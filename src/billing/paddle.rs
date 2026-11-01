@@ -137,7 +137,7 @@ fn expected_catalog_amount_minor(config: &AppConfig, interval: BillingInterval) 
     ((i128::from(inr_minor) + 50) / 100).clamp(0, i128::from(i64::MAX)) as i64
 }
 
-fn checkout_amount_to_paddle_minor(amount_minor: i64) -> Option<i64> {
+pub fn checkout_amount_to_paddle_minor(amount_minor: i64) -> Option<i64> {
     (amount_minor > 0)
         .then(|| (i128::from(amount_minor) + 50) / 100)
         .and_then(|amount| i64::try_from(amount).ok())

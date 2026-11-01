@@ -99,6 +99,10 @@ async fn main() {
             "/api/profile/password",
             patch(routes::profile::update_profile_password),
         )
+        .route(
+            "/api/billing/annual-upgrade-quote",
+            get(routes::billing::annual_upgrade_quote),
+        )
         .route("/api/create-order", post(routes::billing::create_order))
         .route("/api/verify-payment", post(routes::billing::verify_payment))
         .route(
