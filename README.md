@@ -55,10 +55,11 @@ will not appear in it. The backend's migrations use a separate, lowercase SQL
 schema; do not point them at the Next.js database without a reviewed migration
 and authentication integration plan.
 
-Compose reads optional `JWT_SECRET`, `JWT_SESSION_DAYS`, `CORS_ALLOWED_ORIGINS`,
-`BACKEND_PORT`, `S3_BUCKET`, `S3_REGION`, `S3_ACCESS_KEY_ID`,
-`S3_SECRET_ACCESS_KEY`, and `RUST_LOG` values from
-your shell or backend `.env`. It deliberately ignores `DATABASE_URL` and
+Compose reads optional `JWT_SECRET`, `JWT_SESSION_DAYS`, `FRONTEND_BASE_URL`,
+`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GITHUB_CLIENT_ID`,
+`GITHUB_CLIENT_SECRET`, `CORS_ALLOWED_ORIGINS`, `BACKEND_PORT`, `S3_BUCKET`,
+`S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, and `RUST_LOG` values
+from your shell or backend `.env`. It deliberately ignores `DATABASE_URL` and
 `REDIS_URL` there and uses the local services instead. The Compose backend
 connects to Silo at `http://silo:9000`. The development database password,
 Silo credentials, and default JWT secret are **local-only defaults**, not
@@ -88,13 +89,16 @@ Expo web origins at `http://localhost:8081` and `http://localhost:8082` are
 also allowed for local development. If the frontend uses a different origin,
 add that exact origin to `CORS_ALLOWED_ORIGINS` and restart the backend.
 
-Google sign-in uses the Rust API. Set `GOOGLE_CLIENT_ID`,
-`GOOGLE_CLIENT_SECRET`, and `FRONTEND_BASE_URL` in the backend environment, and
-add `http://localhost:8080/api/auth/google/callback` to the Google OAuth
-client's authorized redirect URIs. The API verifies the Google profile,
-requires a verified email, and issues the same HTTP-only session cookie used
-by password sign-in. Existing email/password accounts are not automatically
-linked; sign in with the existing method to avoid silently merging identities.
+Google and GitHub sign-in use the Rust API. Set each provider's client ID and
+client secret (`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GITHUB_CLIENT_ID`,
+and `GITHUB_CLIENT_SECRET`) plus `FRONTEND_BASE_URL` in the backend environment.
+Register `http://localhost:8080/api/auth/google/callback` as the Google
+authorized redirect URI and `http://localhost:8080/api/auth/github/callback`
+as the GitHub OAuth App callback URL. The API requires a verified email from
+each provider (GitHub's verified primary email) and issues the same HTTP-only
+session cookie used by password sign-in. Existing email/password accounts are
+not automatically linked; sign in with the existing method to avoid silently
+merging identities.
 
 ### Local Silo
 

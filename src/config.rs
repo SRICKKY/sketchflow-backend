@@ -12,6 +12,8 @@ pub struct AppConfig {
     pub jwt_session_days: i64,
     pub google_client_id: Option<String>,
     pub google_client_secret: Option<String>,
+    pub github_client_id: Option<String>,
+    pub github_client_secret: Option<String>,
     pub frontend_base_url: String,
     pub cors_allowed_origins: Vec<String>,
     pub asset_storage_dir: String,
@@ -76,6 +78,8 @@ impl AppConfig {
             jwt_session_days: env_var("JWT_SESSION_DAYS", "30").parse().unwrap_or(30),
             google_client_id: env_option("GOOGLE_CLIENT_ID"),
             google_client_secret: env_option("GOOGLE_CLIENT_SECRET"),
+            github_client_id: env_option("GITHUB_CLIENT_ID"),
+            github_client_secret: env_option("GITHUB_CLIENT_SECRET"),
             frontend_base_url: env_var("FRONTEND_BASE_URL", "http://localhost:3000")
                 .trim_end_matches('/')
                 .to_string(),

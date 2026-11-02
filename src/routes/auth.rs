@@ -24,8 +24,9 @@ use crate::{
 };
 
 const GOOGLE_STATE_COOKIE: &str = "sketchflow_google_oauth_state";
-const GOOGLE_STATE_MAX_AGE_SECONDS: i64 = 600;
-type GoogleStateMac = Hmac<Sha256>;
+const GITHUB_STATE_COOKIE: &str = "sketchflow_github_oauth_state";
+const OAUTH_STATE_MAX_AGE_SECONDS: i64 = 600;
+type OAuthStateMac = Hmac<Sha256>;
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct RegisterRequest {
@@ -70,10 +71,23 @@ pub struct GoogleCallbackQuery {
     error: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct GithubStartQuery {
+    mode: Option<String>,
+    return_to: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GithubCallbackQuery {
+    state: Option<String>,
+    code: Option<String>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
-struct GoogleOAuthState {
+struct OAuthState {
     nonce: String,
-    code_verifier: String,
+    code_verifier: Option<String>,
     mode: String,
     return_to: String,
     issued_at: i64,
@@ -91,6 +105,33 @@ struct GoogleUserInfo {
     email_verified: bool,
     name: Option<String>,
     picture: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubTokenResponse {
+    access_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubProfile {
+    id: u64,
+    login: String,
+    name: Option<String>,
+    avatar_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubEmail {
+    email: String,
+    primary: bool,
+    verified: bool,
+}
+
+struct GithubUserInfo {
+    id: String,
+    email: String,
+    name: Option<String>,
+    avatar_url: Option<String>,
 }
 
 fn normalize_email(email: &str) -> String {
@@ -117,13 +158,11 @@ fn safe_auth_mode(value: Option<&str>) -> &str {
     }
 }
 
-fn sign_google_state(value: &GoogleOAuthState, secret: &str) -> AppResult<String> {
+fn sign_oauth_state(value: &OAuthState, secret: &str) -> AppResult<String> {
     let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(value).map_err(|error| {
-        AppError::Internal(anyhow::anyhow!(
-            "failed to serialize Google OAuth state: {error}"
-        ))
+        AppError::Internal(anyhow::anyhow!("failed to serialize OAuth state: {error}"))
     })?);
-    let mut mac = GoogleStateMac::new_from_slice(secret.as_bytes()).map_err(|error| {
+    let mut mac = OAuthStateMac::new_from_slice(secret.as_bytes()).map_err(|error| {
         AppError::Internal(anyhow::anyhow!("invalid OAuth signing key: {error}"))
     })?;
     mac.update(payload.as_bytes());
@@ -131,17 +170,17 @@ fn sign_google_state(value: &GoogleOAuthState, secret: &str) -> AppResult<String
     Ok(format!("{payload}.{signature}"))
 }
 
-fn verify_google_state(value: &str, secret: &str) -> Option<GoogleOAuthState> {
+fn verify_oauth_state(value: &str, secret: &str) -> Option<OAuthState> {
     let (payload, signature) = value.split_once('.')?;
     let signature = URL_SAFE_NO_PAD.decode(signature).ok()?;
-    let mut mac = GoogleStateMac::new_from_slice(secret.as_bytes()).ok()?;
+    let mut mac = OAuthStateMac::new_from_slice(secret.as_bytes()).ok()?;
     mac.update(payload.as_bytes());
     mac.verify_slice(&signature).ok()?;
 
     let payload = URL_SAFE_NO_PAD.decode(payload).ok()?;
-    let state: GoogleOAuthState = serde_json::from_slice(&payload).ok()?;
+    let state: OAuthState = serde_json::from_slice(&payload).ok()?;
     let age = Utc::now().timestamp().checked_sub(state.issued_at)?;
-    if !(0..=GOOGLE_STATE_MAX_AGE_SECONDS).contains(&age)
+    if !(0..=OAUTH_STATE_MAX_AGE_SECONDS).contains(&age)
         || safe_return_to(Some(&state.return_to)) != state.return_to
         || !matches!(state.mode.as_str(), "login" | "register")
     {
@@ -176,11 +215,12 @@ fn frontend_url(state: &AppState, path: &str) -> AppResult<Url> {
     Ok(url)
 }
 
-fn google_error_redirect(
+fn oauth_error_redirect(
     state: &AppState,
     mode: &str,
     return_to: &str,
     error: &str,
+    provider: &str,
 ) -> AppResult<Redirect> {
     let path = if mode == "register" {
         "/register"
@@ -191,11 +231,30 @@ fn google_error_redirect(
     {
         let mut query = url.query_pairs_mut();
         query.append_pair("oauth_error", error);
+        query.append_pair("oauth_provider", provider);
         if return_to != "/dashboard" {
             query.append_pair("callbackUrl", return_to);
         }
     }
     Ok(Redirect::temporary(url.as_str()))
+}
+
+fn google_error_redirect(
+    state: &AppState,
+    mode: &str,
+    return_to: &str,
+    error: &str,
+) -> AppResult<Redirect> {
+    oauth_error_redirect(state, mode, return_to, error, "google")
+}
+
+fn github_error_redirect(
+    state: &AppState,
+    mode: &str,
+    return_to: &str,
+    error: &str,
+) -> AppResult<Redirect> {
+    oauth_error_redirect(state, mode, return_to, error, "github")
 }
 
 fn google_callback_uri(state: &AppState) -> AppResult<String> {
@@ -209,9 +268,29 @@ fn google_callback_uri(state: &AppState) -> AppResult<String> {
     Ok(callback.to_string())
 }
 
+fn github_callback_uri(state: &AppState) -> AppResult<String> {
+    let base = Url::parse(&state.config.public_base_url)
+        .map_err(|error| AppError::Internal(anyhow::anyhow!("invalid PUBLIC_BASE_URL: {error}")))?;
+    let callback = base.join("/api/auth/github/callback").map_err(|error| {
+        AppError::Internal(anyhow::anyhow!(
+            "invalid GitHub OAuth callback URL: {error}"
+        ))
+    })?;
+    Ok(callback.to_string())
+}
+
 fn clear_google_state_cookie(cookies: &Cookies, state: &AppState) {
     let mut cookie = Cookie::new(GOOGLE_STATE_COOKIE, "");
     cookie.set_path("/api/auth/google");
+    cookie.set_http_only(true);
+    cookie.set_same_site(SameSite::Lax);
+    cookie.set_secure(state.config.public_base_url.starts_with("https://"));
+    cookies.remove(cookie);
+}
+
+fn clear_github_state_cookie(cookies: &Cookies, state: &AppState) {
+    let mut cookie = Cookie::new(GITHUB_STATE_COOKIE, "");
+    cookie.set_path("/api/auth/github");
     cookie.set_http_only(true);
     cookie.set_same_site(SameSite::Lax);
     cookie.set_secure(state.config.public_base_url.starts_with("https://"));
@@ -380,22 +459,22 @@ pub async fn google_start(
         return google_error_redirect(&state, &mode, &return_to, "not_configured");
     };
 
-    let oauth_state = GoogleOAuthState {
+    let code_verifier = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
+    let oauth_state = OAuthState {
         nonce: Uuid::new_v4().simple().to_string(),
-        code_verifier: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
+        code_verifier: Some(code_verifier),
         mode,
         return_to,
         issued_at: Utc::now().timestamp(),
     };
-    let cookie_value = sign_google_state(&oauth_state, &state.config.jwt_secret)?;
-    let code_challenge =
-        URL_SAFE_NO_PAD.encode(Sha256::digest(oauth_state.code_verifier.as_bytes()));
+    let cookie_value = sign_oauth_state(&oauth_state, &state.config.jwt_secret)?;
     let cookie = Cookie::build((GOOGLE_STATE_COOKIE, cookie_value))
         .path("/api/auth/google")
         .http_only(true)
         .same_site(SameSite::Lax)
         .secure(state.config.public_base_url.starts_with("https://"))
-        .max_age(CookieDuration::seconds(GOOGLE_STATE_MAX_AGE_SECONDS))
+        .max_age(CookieDuration::seconds(OAUTH_STATE_MAX_AGE_SECONDS))
         .build();
     cookies.add(cookie);
 
@@ -439,7 +518,7 @@ pub async fn google_callback(
 
     let Some(oauth_state) = cookie_value
         .as_deref()
-        .and_then(|value| verify_google_state(value, &state.config.jwt_secret))
+        .and_then(|value| verify_oauth_state(value, &state.config.jwt_secret))
     else {
         return google_error_redirect(&state, "login", "/dashboard", "invalid_state");
     };
@@ -474,27 +553,38 @@ pub async fn google_callback(
         );
     };
 
-    let profile = match google_user_info(
-        code,
-        client_id,
-        client_secret,
-        &oauth_state.code_verifier,
+    let Some(code_verifier) = oauth_state.code_verifier.as_deref() else {
+        return google_error_redirect(
+            &state,
+            &oauth_state.mode,
+            &oauth_state.return_to,
+            "invalid_state",
+        );
+    };
+    let profile =
+        match google_user_info(code, client_id, client_secret, code_verifier, &state).await {
+            Ok(profile) => profile,
+            Err(error) => {
+                tracing::warn!(error = %error, "Google OAuth user info request failed");
+                return google_error_redirect(
+                    &state,
+                    &oauth_state.mode,
+                    &oauth_state.return_to,
+                    "failed",
+                );
+            }
+        };
+    let user = match find_or_create_oauth_user(
         &state,
+        "google",
+        &profile.sub,
+        &profile.email,
+        profile.name.as_deref(),
+        profile.picture.as_deref(),
+        "Google",
     )
     .await
     {
-        Ok(profile) => profile,
-        Err(error) => {
-            tracing::warn!(error = %error, "Google OAuth user info request failed");
-            return google_error_redirect(
-                &state,
-                &oauth_state.mode,
-                &oauth_state.return_to,
-                "failed",
-            );
-        }
-    };
-    let user = match find_or_create_google_user(&state, &profile).await {
         Ok(user) => user,
         Err(error) => {
             tracing::error!(error = ?error, "Google OAuth account provisioning failed");
@@ -504,6 +594,159 @@ pub async fn google_callback(
                 "failed"
             };
             return google_error_redirect(&state, &oauth_state.mode, &oauth_state.return_to, code);
+        }
+    };
+    session::set_session_cookie(&cookies, &state, &user.id)?;
+    let destination = frontend_url(&state, &oauth_state.return_to)?;
+    Ok(Redirect::temporary(destination.as_str()))
+}
+
+/// Begin GitHub OAuth and bind the callback to a signed, short-lived state cookie.
+#[utoipa::path(
+    get,
+    path = "/api/auth/github/start",
+    tag = "auth",
+    params(
+        ("mode" = Option<String>, Query, description = "login or register"),
+        ("return_to" = Option<String>, Query, description = "Safe UI-relative path after sign-in")
+    ),
+    responses((status = 307, description = "Redirect to GitHub's authorization page"))
+)]
+pub async fn github_start(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Query(query): Query<GithubStartQuery>,
+) -> AppResult<Redirect> {
+    let mode = safe_auth_mode(query.mode.as_deref()).to_string();
+    let return_to = safe_return_to(query.return_to.as_deref()).to_string();
+    let (Some(client_id), Some(_)) = (
+        state.config.github_client_id.as_deref(),
+        state.config.github_client_secret.as_deref(),
+    ) else {
+        return github_error_redirect(&state, &mode, &return_to, "not_configured");
+    };
+
+    let oauth_state = OAuthState {
+        nonce: Uuid::new_v4().simple().to_string(),
+        code_verifier: None,
+        mode,
+        return_to,
+        issued_at: Utc::now().timestamp(),
+    };
+    let cookie_value = sign_oauth_state(&oauth_state, &state.config.jwt_secret)?;
+    let cookie = Cookie::build((GITHUB_STATE_COOKIE, cookie_value))
+        .path("/api/auth/github")
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .secure(state.config.public_base_url.starts_with("https://"))
+        .max_age(CookieDuration::seconds(OAUTH_STATE_MAX_AGE_SECONDS))
+        .build();
+    cookies.add(cookie);
+
+    let mut authorization_url = Url::parse("https://github.com/login/oauth/authorize")
+        .map_err(|error| AppError::Internal(anyhow::anyhow!(error)))?;
+    {
+        let mut query = authorization_url.query_pairs_mut();
+        query
+            .append_pair("client_id", client_id)
+            .append_pair("redirect_uri", &github_callback_uri(&state)?)
+            .append_pair("scope", "read:user user:email")
+            .append_pair("state", &oauth_state.nonce);
+    }
+    Ok(Redirect::temporary(authorization_url.as_str()))
+}
+
+/// Complete GitHub OAuth using a verified primary email and the existing API session.
+#[utoipa::path(
+    get,
+    path = "/api/auth/github/callback",
+    tag = "auth",
+    params(
+        ("state" = Option<String>, Query, description = "OAuth state returned by GitHub"),
+        ("code" = Option<String>, Query, description = "Authorization code returned by GitHub"),
+        ("error" = Option<String>, Query, description = "OAuth error returned by GitHub")
+    ),
+    responses((status = 307, description = "Redirect to the UI after authentication"))
+)]
+pub async fn github_callback(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Query(query): Query<GithubCallbackQuery>,
+) -> AppResult<Redirect> {
+    let cookie_value = cookies
+        .get(GITHUB_STATE_COOKIE)
+        .map(|cookie| cookie.value().to_string());
+    clear_github_state_cookie(&cookies, &state);
+
+    let Some(oauth_state) = cookie_value
+        .as_deref()
+        .and_then(|value| verify_oauth_state(value, &state.config.jwt_secret))
+    else {
+        return github_error_redirect(&state, "login", "/dashboard", "invalid_state");
+    };
+    if query.state.as_deref() != Some(oauth_state.nonce.as_str()) {
+        return github_error_redirect(
+            &state,
+            &oauth_state.mode,
+            &oauth_state.return_to,
+            "invalid_state",
+        );
+    }
+    if let Some(provider_error) = query.error.as_deref() {
+        let error = if provider_error == "access_denied" {
+            "cancelled"
+        } else {
+            "failed"
+        };
+        return github_error_redirect(&state, &oauth_state.mode, &oauth_state.return_to, error);
+    }
+    let Some(code) = query.code.as_deref() else {
+        return github_error_redirect(&state, &oauth_state.mode, &oauth_state.return_to, "failed");
+    };
+    let (Some(client_id), Some(client_secret)) = (
+        state.config.github_client_id.as_deref(),
+        state.config.github_client_secret.as_deref(),
+    ) else {
+        return github_error_redirect(
+            &state,
+            &oauth_state.mode,
+            &oauth_state.return_to,
+            "not_configured",
+        );
+    };
+
+    let profile = match github_user_info(code, client_id, client_secret, &state).await {
+        Ok(profile) => profile,
+        Err(error) => {
+            tracing::warn!(error = %error, "GitHub OAuth user info request failed");
+            return github_error_redirect(
+                &state,
+                &oauth_state.mode,
+                &oauth_state.return_to,
+                "failed",
+            );
+        }
+    };
+    let user = match find_or_create_oauth_user(
+        &state,
+        "github",
+        &profile.id,
+        &profile.email,
+        profile.name.as_deref(),
+        profile.avatar_url.as_deref(),
+        "GitHub",
+    )
+    .await
+    {
+        Ok(user) => user,
+        Err(error) => {
+            tracing::error!(error = ?error, "GitHub OAuth account provisioning failed");
+            let code = if matches!(error, AppError::Conflict(_)) {
+                "account_exists"
+            } else {
+                "failed"
+            };
+            return github_error_redirect(&state, &oauth_state.mode, &oauth_state.return_to, code);
         }
     };
     session::set_session_cookie(&cookies, &state, &user.id)?;
@@ -597,19 +840,174 @@ async fn google_user_info(
     Ok(profile)
 }
 
-async fn find_or_create_google_user(state: &AppState, profile: &GoogleUserInfo) -> AppResult<User> {
-    let email = normalize_email(&profile.email);
+async fn github_user_info(
+    code: &str,
+    client_id: &str,
+    client_secret: &str,
+    state: &AppState,
+) -> AppResult<GithubUserInfo> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|error| {
+            AppError::Internal(anyhow::anyhow!(
+                "failed to initialize GitHub OAuth HTTP client: {error}"
+            ))
+        })?;
+    let token_response = client
+        .post("https://github.com/login/oauth/access_token")
+        .header(reqwest::header::ACCEPT, "application/json")
+        .form(&[
+            ("code", code),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("redirect_uri", github_callback_uri(state)?.as_str()),
+        ])
+        .send()
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "GitHub OAuth token exchange failed");
+            AppError::Gateway(502, "GitHub sign-in could not be completed.".to_string())
+        })?;
+    if !token_response.status().is_success() {
+        tracing::warn!(
+            status = %token_response.status(),
+            "GitHub OAuth token exchange was rejected"
+        );
+        return Err(AppError::Gateway(
+            502,
+            "GitHub sign-in could not be completed.".to_string(),
+        ));
+    }
+    let token = token_response
+        .json::<GithubTokenResponse>()
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "GitHub OAuth token response was invalid");
+            AppError::Gateway(502, "GitHub sign-in could not be completed.".to_string())
+        })?;
+
+    let profile_response = client
+        .get("https://api.github.com/user")
+        .bearer_auth(&token.access_token)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header(reqwest::header::USER_AGENT, "SketchFlow")
+        .send()
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "GitHub profile request failed");
+            AppError::Gateway(502, "GitHub sign-in could not be completed.".to_string())
+        })?;
+    if !profile_response.status().is_success() {
+        tracing::warn!(
+            status = %profile_response.status(),
+            "GitHub profile request was rejected"
+        );
+        return Err(AppError::Gateway(
+            502,
+            "GitHub sign-in could not be completed.".to_string(),
+        ));
+    }
+    let profile = profile_response
+        .json::<GithubProfile>()
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "GitHub profile response was invalid");
+            AppError::Gateway(502, "GitHub sign-in could not be completed.".to_string())
+        })?;
+    if profile.id == 0 || profile.login.trim().is_empty() {
+        return Err(AppError::Unauthorized(
+            "GitHub did not return a valid account.".to_string(),
+        ));
+    }
+
+    let emails_response = client
+        .get("https://api.github.com/user/emails")
+        .bearer_auth(&token.access_token)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header(reqwest::header::USER_AGENT, "SketchFlow")
+        .send()
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "GitHub email request failed");
+            AppError::Gateway(502, "GitHub sign-in could not be completed.".to_string())
+        })?;
+    if !emails_response.status().is_success() {
+        tracing::warn!(
+            status = %emails_response.status(),
+            "GitHub email request was rejected"
+        );
+        return Err(AppError::Gateway(
+            502,
+            "GitHub sign-in could not be completed.".to_string(),
+        ));
+    }
+    let emails = emails_response
+        .json::<Vec<GithubEmail>>()
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "GitHub email response was invalid");
+            AppError::Gateway(502, "GitHub sign-in could not be completed.".to_string())
+        })?;
+    let email = verified_primary_github_email(emails).ok_or_else(|| {
+        AppError::Unauthorized(
+            "GitHub did not provide a verified primary email address.".to_string(),
+        )
+    })?;
+
+    let name = profile
+        .name
+        .filter(|name| !name.trim().is_empty())
+        .or(Some(profile.login));
+    Ok(GithubUserInfo {
+        id: profile.id.to_string(),
+        email,
+        name,
+        avatar_url: profile.avatar_url,
+    })
+}
+
+fn verified_primary_github_email(emails: Vec<GithubEmail>) -> Option<String> {
+    emails
+        .into_iter()
+        .find(|email| email.primary && email.verified)
+        .map(|email| normalize_email(&email.email))
+        .filter(|email| {
+            !email.chars().any(char::is_whitespace)
+                && email.split_once('@').is_some_and(|(local, domain)| {
+                    !local.is_empty()
+                        && !domain.contains('@')
+                        && domain.contains('.')
+                        && !domain.starts_with('.')
+                        && !domain.ends_with('.')
+                })
+        })
+}
+
+async fn find_or_create_oauth_user(
+    state: &AppState,
+    provider: &str,
+    provider_account_id: &str,
+    email: &str,
+    name: Option<&str>,
+    image: Option<&str>,
+    provider_name: &str,
+) -> AppResult<User> {
+    let email = normalize_email(email);
     let mut transaction = state.db.begin().await?;
     if let Some(user) = sqlx::query_as::<_, User>(
         r#"
         SELECT users.*
         FROM users
         JOIN accounts ON accounts.user_id = users.id
-        WHERE accounts.provider = 'google'
-          AND accounts.provider_account_id = $1
+        WHERE accounts.provider = $1
+          AND accounts.provider_account_id = $2
         "#,
     )
-    .bind(&profile.sub)
+    .bind(provider)
+    .bind(provider_account_id)
     .fetch_optional(&mut *transaction)
     .await?
     {
@@ -627,15 +1025,8 @@ async fn find_or_create_google_user(state: &AppState, profile: &GoogleUserInfo) 
         ));
     }
 
-    let name = profile
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let image = profile
-        .picture
-        .as_deref()
-        .filter(|value| value.starts_with("https://"));
+    let name = name.map(str::trim).filter(|value| !value.is_empty());
+    let image = image.filter(|value| value.starts_with("https://"));
     let user = sqlx::query_as::<_, User>(
         r#"
         INSERT INTO users (id, name, email, email_verified, image)
@@ -656,11 +1047,12 @@ async fn find_or_create_google_user(state: &AppState, profile: &GoogleUserInfo) 
             SELECT users.*
             FROM users
             JOIN accounts ON accounts.user_id = users.id
-            WHERE accounts.provider = 'google'
-              AND accounts.provider_account_id = $1
+            WHERE accounts.provider = $1
+              AND accounts.provider_account_id = $2
             "#,
         )
-        .bind(&profile.sub)
+        .bind(provider)
+        .bind(provider_account_id)
         .fetch_optional(&mut *transaction)
         .await?;
         if let Some(user) = concurrently_linked_user {
@@ -675,31 +1067,33 @@ async fn find_or_create_google_user(state: &AppState, profile: &GoogleUserInfo) 
     sqlx::query(
         r#"
         INSERT INTO accounts (user_id, type, provider, provider_account_id)
-        VALUES ($1, 'oauth', 'google', $2)
+        VALUES ($1, 'oauth', $2, $3)
         ON CONFLICT (provider, provider_account_id) DO NOTHING
         "#,
     )
     .bind(&user.id)
-    .bind(&profile.sub)
+    .bind(provider)
+    .bind(provider_account_id)
     .execute(&mut *transaction)
     .await?;
     let linked_user_id = sqlx::query_scalar::<_, String>(
-        "SELECT user_id FROM accounts WHERE provider = 'google' AND provider_account_id = $1",
+        "SELECT user_id FROM accounts WHERE provider = $1 AND provider_account_id = $2",
     )
-    .bind(&profile.sub)
+    .bind(provider)
+    .bind(provider_account_id)
     .fetch_one(&mut *transaction)
     .await?;
     if linked_user_id != user.id {
-        return Err(AppError::Conflict(
-            "This Google account is linked to a different SketchFlow account.".to_string(),
-        ));
+        return Err(AppError::Conflict(format!(
+            "This {provider_name} account is linked to a different SketchFlow account."
+        )));
     }
     transaction.commit().await?;
     Ok(user)
 }
 
 #[cfg(test)]
-mod google_oauth_tests {
+mod oauth_tests {
     use super::*;
 
     #[test]
@@ -718,19 +1112,56 @@ mod google_oauth_tests {
 
     #[test]
     fn signed_oauth_state_round_trips_and_rejects_tampering() {
-        let state = GoogleOAuthState {
+        let state = OAuthState {
             nonce: "random-oauth-state".to_string(),
-            code_verifier: "a".repeat(64),
+            code_verifier: Some("a".repeat(64)),
             mode: "register".to_string(),
             return_to: "/dashboard?tab=recent".to_string(),
             issued_at: Utc::now().timestamp(),
         };
-        let cookie = sign_google_state(&state, "test-secret").unwrap();
+        let cookie = sign_oauth_state(&state, "test-secret").unwrap();
 
         assert_eq!(
-            verify_google_state(&cookie, "test-secret").map(|decoded| decoded.nonce),
+            verify_oauth_state(&cookie, "test-secret").map(|decoded| decoded.nonce),
             Some("random-oauth-state".to_string())
         );
-        assert!(verify_google_state(&cookie, "different-secret").is_none());
+        assert!(verify_oauth_state(&cookie, "different-secret").is_none());
+    }
+
+    #[test]
+    fn github_email_must_be_verified_and_primary() {
+        let emails = vec![
+            GithubEmail {
+                email: "private@example.com".to_string(),
+                primary: true,
+                verified: false,
+            },
+            GithubEmail {
+                email: "secondary@example.com".to_string(),
+                primary: false,
+                verified: true,
+            },
+            GithubEmail {
+                email: "USER@Example.COM".to_string(),
+                primary: true,
+                verified: true,
+            },
+        ];
+
+        assert_eq!(
+            verified_primary_github_email(emails),
+            Some("user@example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_github_email_list_without_a_verified_primary_address() {
+        let emails = vec![GithubEmail {
+            email: "not-an-email".to_string(),
+            primary: true,
+            verified: true,
+        }];
+
+        assert_eq!(verified_primary_github_email(emails), None);
     }
 }
