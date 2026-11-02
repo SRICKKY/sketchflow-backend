@@ -96,6 +96,11 @@ async fn main() {
         .route("/health", get(routes::health::health))
         .route("/api/auth/register", post(routes::auth::register))
         .route("/api/auth/login", post(routes::auth::login))
+        .route("/api/auth/google/start", get(routes::auth::google_start))
+        .route(
+            "/api/auth/google/callback",
+            get(routes::auth::google_callback),
+        )
         .route("/api/auth/logout", post(routes::auth::logout))
         .route("/api/auth/session", get(routes::auth::get_session))
         .route("/api/profile", patch(routes::profile::update_profile_name))

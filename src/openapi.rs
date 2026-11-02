@@ -30,6 +30,8 @@ use crate::routes::{
         health::health,
         auth::register,
         auth::login,
+        auth::google_start,
+        auth::google_callback,
         auth::logout,
         auth::get_session,
         billing::annual_upgrade_quote,
