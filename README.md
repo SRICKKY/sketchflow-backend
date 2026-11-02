@@ -88,6 +88,14 @@ Expo web origins at `http://localhost:8081` and `http://localhost:8082` are
 also allowed for local development. If the frontend uses a different origin,
 add that exact origin to `CORS_ALLOWED_ORIGINS` and restart the backend.
 
+Google sign-in uses the Rust API. Set `GOOGLE_CLIENT_ID`,
+`GOOGLE_CLIENT_SECRET`, and `FRONTEND_BASE_URL` in the backend environment, and
+add `http://localhost:8080/api/auth/google/callback` to the Google OAuth
+client's authorized redirect URIs. The API verifies the Google profile,
+requires a verified email, and issues the same HTTP-only session cookie used
+by password sign-in. Existing email/password accounts are not automatically
+linked; sign in with the existing method to avoid silently merging identities.
+
 ### Local Silo
 
 ```bash

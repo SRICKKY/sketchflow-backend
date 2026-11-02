@@ -54,7 +54,7 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # HTTP client (Razorpay)
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["form", "json", "rustls"] }
 
 # PDF generation (invoices)
 printpdf = "0.12"
