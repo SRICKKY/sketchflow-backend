@@ -32,6 +32,8 @@ use crate::routes::{
         auth::login,
         auth::google_start,
         auth::google_callback,
+        auth::github_start,
+        auth::github_callback,
         auth::logout,
         auth::get_session,
         billing::annual_upgrade_quote,

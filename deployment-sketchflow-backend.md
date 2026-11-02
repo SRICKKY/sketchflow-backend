@@ -120,10 +120,12 @@ EC2/systemd provisioning steps are in
 - Add an A record for `backend.sketchflow.online` pointing to the EC2 Elastic IP.
 - Configure the API runtime with production values, including:
   - `HOST=127.0.0.1` and `PORT=8080` behind Nginx.
-  - `PUBLIC_BASE_URL=https://backend.sketchflow.online`; the Google OAuth
-    callback is `https://backend.sketchflow.online/api/auth/google/callback`.
+  - `PUBLIC_BASE_URL=https://backend.sketchflow.online`; OAuth callbacks are
+    `https://backend.sketchflow.online/api/auth/google/callback` and
+    `https://backend.sketchflow.online/api/auth/github/callback`.
   - `FRONTEND_BASE_URL=https://sketchflow.online`.
   - `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` from a Google OAuth client.
+  - `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` from a GitHub OAuth App.
   - `CORS_ALLOWED_ORIGINS` set to the exact production UI origin(s), for
     example `https://sketchflow.online` and `https://www.sketchflow.online`
     only if both are actually used.
@@ -132,9 +134,11 @@ EC2/systemd provisioning steps are in
 - Store runtime secrets in Parameter Store or Secrets Manager and let the EC2
   instance role retrieve only the required parameters. Never put secrets in
   the deployment artifact or repository.
-- Add the exact callback URL above to the OAuth client's authorized redirect
-  URIs. For local development, use
-  `http://localhost:8080/api/auth/google/callback`.
+- Add the exact Google callback URL above to the Google OAuth client's
+  authorized redirect URIs and the GitHub callback URL to the GitHub OAuth
+  App's callback URL. For local development, use
+  `http://localhost:8080/api/auth/google/callback` and
+  `http://localhost:8080/api/auth/github/callback`, respectively.
 - Set the UI's production API base URL to `https://backend.sketchflow.online`
   and make collaboration use `wss://backend.sketchflow.online`.
 - Before switching production traffic, verify how the UI resolves relative

@@ -101,6 +101,11 @@ async fn main() {
             "/api/auth/google/callback",
             get(routes::auth::google_callback),
         )
+        .route("/api/auth/github/start", get(routes::auth::github_start))
+        .route(
+            "/api/auth/github/callback",
+            get(routes::auth::github_callback),
+        )
         .route("/api/auth/logout", post(routes::auth::logout))
         .route("/api/auth/session", get(routes::auth::get_session))
         .route("/api/profile", patch(routes::profile::update_profile_name))
