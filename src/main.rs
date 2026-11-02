@@ -34,6 +34,10 @@ const MAX_MULTIPART_BODY_BYTES: usize = profile::avatar::AVATAR_MAX_BYTES as usi
 
 #[tokio::main]
 async fn main() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install Rustls ring crypto provider");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

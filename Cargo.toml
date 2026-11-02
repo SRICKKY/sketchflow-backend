@@ -30,6 +30,7 @@ sqlx = { version = "0.8", features = [
   "json",
   "migrate",
 ] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 # OpenAPI / Swagger
 utoipa = { version = "6", features = ["axum_extras", "chrono", "uuid"] }
