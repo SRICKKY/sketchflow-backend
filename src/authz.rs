@@ -47,7 +47,8 @@ pub async fn get_board_access(
     user_id: &str,
 ) -> Result<Option<BoardAccess>, AppError> {
     let Some(board) = sqlx::query_as::<_, BoardRow>(
-        "SELECT id, owner_id, workspace_id FROM boards WHERE id = $1",
+        "SELECT id, owner_id, workspace_id FROM boards
+         WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(board_id)
     .fetch_optional(db)

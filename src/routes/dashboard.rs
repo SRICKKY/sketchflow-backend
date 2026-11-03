@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -31,8 +31,29 @@ pub fn router() -> Router<AppState> {
             "/api/boards/{id}",
             get(get_board).patch(rename_board).delete(delete_board),
         )
+        .route(
+            "/api/boards/{id}/favorite",
+            put(favorite_board).delete(unfavorite_board),
+        )
         .route("/api/boards/{id}/duplicate", post(duplicate_board))
         .route("/api/boards/{id}/template", post(save_template))
+        .route("/api/trash/{id}/restore", post(restore_board))
+        .route(
+            "/api/trash/{id}",
+            axum::routing::delete(permanently_delete_board),
+        )
+        .route(
+            "/api/collections",
+            get(list_private_collections).post(create_private_collection),
+        )
+        .route(
+            "/api/collections/{id}",
+            axum::routing::delete(delete_private_collection),
+        )
+        .route(
+            "/api/collections/{collection_id}/boards/{board_id}",
+            put(add_board_to_collection).delete(remove_board_from_collection),
+        )
         .route(
             "/api/boards/{id}/members",
             get(board_members).post(add_board_member),
@@ -79,6 +100,7 @@ pub struct BoardSummary {
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     element_count: i64,
+    is_favorite: bool,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -97,6 +119,14 @@ struct Capabilities {
     max_owned_boards: Option<i64>,
     can_create_board: bool,
     can_save_templates: bool,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+struct PrivateCollectionSummary {
+    id: String,
+    name: String,
+    board_count: i64,
 }
 
 #[derive(Serialize)]
@@ -202,10 +232,17 @@ struct NameInput {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrivateCollectionInput {
+    name: String,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BoardQuery {
     scope: Option<String>,
     workspace_id: Option<String>,
+    collection_id: Option<String>,
     q: Option<String>,
     limit: Option<u32>,
     cursor: Option<String>,
@@ -410,10 +447,13 @@ async fn dashboard(
 
 const BOARD_SELECT: &str = "SELECT b.id,b.name,b.owner_id,owner.name AS owner_name,b.workspace_id,b.created_at,b.updated_at,
     CASE WHEN b.owner_id=$1 THEN 'OWNER' ELSE COALESCE(m.role::text,CASE WHEN wm.role::text IN ('OWNER','ADMIN') THEN 'EDITOR' ELSE 'VIEWER' END) END AS role,
-    (SELECT count(*) FROM board_elements e WHERE e.board_id=b.id) AS element_count
+    (SELECT count(*) FROM board_elements e WHERE e.board_id=b.id) AS element_count,
+    (favorite.board_id IS NOT NULL) AS is_favorite
     FROM boards b JOIN users owner ON owner.id=b.owner_id
     LEFT JOIN board_members m ON m.board_id=b.id AND m.user_id=$1
-    LEFT JOIN workspace_members wm ON wm.workspace_id=b.workspace_id AND wm.user_id=$1";
+    LEFT JOIN workspace_members wm ON wm.workspace_id=b.workspace_id AND wm.user_id=$1
+    LEFT JOIN board_favorites favorite ON favorite.board_id=b.id AND favorite.user_id=$1
+    LEFT JOIN private_collection_boards cboard ON cboard.board_id=b.id AND cboard.owner_id=$1";
 
 async fn board_summary(db: &PgPool, board_id: &str, user_id: &str) -> AppResult<BoardSummary> {
     authz::require_board_role(db, board_id, user_id, BoardRole::Viewer).await?;
@@ -444,9 +484,9 @@ async fn list_boards(
         .map(BoardCursor::decode)
         .transpose()?;
     let scope = query.scope.as_deref().unwrap_or("owned");
-    if !matches!(scope, "owned" | "shared") {
+    if !matches!(scope, "owned" | "shared" | "favorites" | "trash") {
         return Err(AppError::BadRequest(
-            "scope must be owned or shared.".into(),
+            "scope must be owned, shared, favorites, or trash.".into(),
         ));
     }
     if query.q.as_ref().is_some_and(|q| q.chars().count() > 200) {
@@ -455,18 +495,46 @@ async fn list_boards(
         ));
     }
     let workspace = query.workspace_id.as_deref().filter(|s| !s.is_empty());
+    let collection_id = query.collection_id.as_deref().filter(|s| !s.is_empty());
     if let Some(workspace) = workspace {
         workspace_role(&state.db, workspace, &user.id, "MEMBER").await?;
     }
-    let condition = if workspace.is_some() {
-        "b.workspace_id=$2"
-    } else if scope == "shared" {
-        "b.workspace_id IS NULL AND b.owner_id<>$1 AND m.id IS NOT NULL AND $2::text IS NULL"
+    if collection_id.is_some() && (scope != "owned" || workspace.is_some()) {
+        return Err(AppError::BadRequest(
+            "Private collections can only filter owned boards.".into(),
+        ));
+    }
+    if matches!(scope, "favorites" | "trash") && workspace.is_some() {
+        return Err(AppError::BadRequest(
+            "Workspace filtering is not supported for this board scope.".into(),
+        ));
+    }
+    if let Some(collection_id) = collection_id {
+        require_private_collections_pro(&state.db, &user.id).await?;
+        require_owned_collection(&state.db, collection_id, &user.id).await?;
+    }
+    let user_is_pro = if scope == "favorites" || workspace.is_some() {
+        is_pro(&state.db, &user.id).await?
     } else {
-        "b.workspace_id IS NULL AND b.owner_id=$1 AND $2::text IS NULL"
+        false
+    };
+    let condition = if workspace.is_some() {
+        "b.deleted_at IS NULL AND b.workspace_id=$2"
+    } else if scope == "shared" {
+        "b.deleted_at IS NULL AND b.workspace_id IS NULL AND b.owner_id<>$1 AND m.id IS NOT NULL AND $2::text IS NULL"
+    } else if scope == "favorites" {
+        "b.deleted_at IS NULL AND favorite.board_id IS NOT NULL AND $2::text IS NULL AND
+         (b.owner_id=$1 OR m.id IS NOT NULL OR ($8::boolean AND wm.user_id=$1))"
+    } else if scope == "trash" {
+        "b.deleted_at IS NOT NULL AND b.owner_id=$1 AND $2::text IS NULL"
+    } else {
+        "b.deleted_at IS NULL AND b.workspace_id IS NULL AND b.owner_id=$1 AND $2::text IS NULL"
     };
     let mut items: Vec<BoardSummary> = sqlx::query_as(&format!(
-        "{BOARD_SELECT} WHERE {condition} AND strpos(lower(b.name),lower($3))>0
+        "{BOARD_SELECT} WHERE {condition}
+        AND ($7::text IS NULL OR (b.owner_id=$1 AND cboard.collection_id=$7))
+        AND (b.owner_id=$1 OR m.id IS NOT NULL OR ($8::boolean AND wm.user_id=$1))
+        AND strpos(lower(b.name),lower($3))>0
         AND ($4::timestamptz IS NULL OR (b.updated_at,b.id)<($4,$5))
         ORDER BY b.updated_at DESC,b.id DESC LIMIT $6"
     ))
@@ -476,6 +544,8 @@ async fn list_boards(
     .bind(cursor.as_ref().map(|c| c.updated_at))
     .bind(cursor.as_ref().map(|c| c.id.as_str()))
     .bind(i64::from(limit) + 1)
+    .bind(collection_id)
+    .bind(user_is_pro)
     .fetch_all(&state.db)
     .await?;
     let next_cursor = if items.len() > limit as usize {
@@ -724,11 +794,237 @@ async fn delete_board(
     let mut tx = state.db.begin().await?;
     lock_resource(&mut tx, "boards", &board_id).await?;
     authz::require_board_role(&state.db, &board_id, &user.id, BoardRole::Owner).await?;
-    sqlx::query("DELETE FROM boards WHERE id=$1")
+    sqlx::query("UPDATE boards SET deleted_at=now(),updated_at=now() WHERE id=$1")
         .bind(board_id)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    Ok(Json(json!({"success":true})))
+}
+
+async fn restore_board(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Path(board_id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let user = session::require_current_user(&cookies, &state).await?;
+    let mut tx = state.db.begin().await?;
+    let row = sqlx::query_as::<_, (String, Option<DateTime<Utc>>)>(
+        "SELECT owner_id,deleted_at FROM boards WHERE id=$1 FOR UPDATE",
+    )
+    .bind(&board_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::NotFound("Board not found".into()))?;
+    if row.0 != user.id {
+        return Err(AppError::Forbidden(
+            "Only the board owner can restore this board.".into(),
+        ));
+    }
+    if row.1.is_none() {
+        return Err(AppError::Conflict("Board is not in Trash.".into()));
+    }
+    sqlx::query("UPDATE boards SET deleted_at=NULL,updated_at=now() WHERE id=$1")
+        .bind(&board_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(json!({"success":true})))
+}
+
+async fn permanently_delete_board(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Path(board_id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let user = session::require_current_user(&cookies, &state).await?;
+    let mut tx = state.db.begin().await?;
+    let row = sqlx::query_as::<_, (String, Option<DateTime<Utc>>)>(
+        "SELECT owner_id,deleted_at FROM boards WHERE id=$1 FOR UPDATE",
+    )
+    .bind(&board_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::NotFound("Board not found".into()))?;
+    if row.0 != user.id {
+        return Err(AppError::Forbidden(
+            "Only the board owner can permanently delete this board.".into(),
+        ));
+    }
+    if row.1.is_none() {
+        return Err(AppError::Conflict(
+            "Move the board to Trash before permanently deleting it.".into(),
+        ));
+    }
+    sqlx::query("DELETE FROM boards WHERE id=$1")
+        .bind(&board_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(json!({"success":true})))
+}
+
+async fn favorite_board(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Path(board_id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let user = session::require_current_user(&cookies, &state).await?;
+    authz::require_board_role(&state.db, &board_id, &user.id, BoardRole::Viewer).await?;
+    sqlx::query(
+        "INSERT INTO board_favorites(user_id,board_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
+    )
+    .bind(&user.id)
+    .bind(&board_id)
+    .execute(&state.db)
+    .await?;
+    Ok(Json(json!({"success":true,"isFavorite":true})))
+}
+
+async fn unfavorite_board(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Path(board_id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let user = session::require_current_user(&cookies, &state).await?;
+    authz::require_board_role(&state.db, &board_id, &user.id, BoardRole::Viewer).await?;
+    sqlx::query("DELETE FROM board_favorites WHERE user_id=$1 AND board_id=$2")
+        .bind(&user.id)
+        .bind(&board_id)
+        .execute(&state.db)
+        .await?;
+    Ok(Json(json!({"success":true,"isFavorite":false})))
+}
+
+async fn require_private_collections_pro(db: &PgPool, user_id: &str) -> AppResult<()> {
+    if !is_pro(db, user_id).await? {
+        return Err(AppError::Forbidden(
+            "Private collections require an active Pro subscription.".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn require_owned_collection(
+    db: &PgPool,
+    collection_id: &str,
+    user_id: &str,
+) -> AppResult<()> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM private_collections WHERE id=$1 AND owner_id=$2)",
+    )
+    .bind(collection_id)
+    .bind(user_id)
+    .fetch_one(db)
+    .await?;
+    if !exists {
+        return Err(AppError::NotFound("Collection not found".into()));
+    }
+    Ok(())
+}
+
+async fn list_private_collections(
+    State(state): State<AppState>,
+    cookies: Cookies,
+) -> AppResult<Json<Items<PrivateCollectionSummary>>> {
+    let user = session::require_current_user(&cookies, &state).await?;
+    require_private_collections_pro(&state.db, &user.id).await?;
+    let items = sqlx::query_as::<_, PrivateCollectionSummary>(
+        "SELECT c.id,c.name,count(cb.board_id)::bigint AS board_count
+         FROM private_collections c
+         LEFT JOIN private_collection_boards cb
+           ON cb.collection_id=c.id AND cb.owner_id=c.owner_id
+         WHERE c.owner_id=$1
+         GROUP BY c.id
+         ORDER BY c.created_at,c.id",
+    )
+    .bind(&user.id)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(Items { items }))
+}
+
+async fn create_private_collection(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    AppJson(input): AppJson<PrivateCollectionInput>,
+) -> AppResult<(StatusCode, Json<PrivateCollectionSummary>)> {
+    let user = session::require_current_user(&cookies, &state).await?;
+    require_private_collections_pro(&state.db, &user.id).await?;
+    let collection_name = name(&input.name, 40)?;
+    let collection_id = id();
+    sqlx::query("INSERT INTO private_collections(id,owner_id,name) VALUES($1,$2,$3)")
+        .bind(&collection_id)
+        .bind(&user.id)
+        .bind(collection_name)
+        .execute(&state.db)
+        .await?;
+    let collection = sqlx::query_as::<_, PrivateCollectionSummary>(
+        "SELECT id,name,0::bigint AS board_count FROM private_collections WHERE id=$1",
+    )
+    .bind(collection_id)
+    .fetch_one(&state.db)
+    .await?;
+    Ok((StatusCode::CREATED, Json(collection)))
+}
+
+async fn delete_private_collection(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Path(collection_id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let user = session::require_current_user(&cookies, &state).await?;
+    require_private_collections_pro(&state.db, &user.id).await?;
+    let result = sqlx::query("DELETE FROM private_collections WHERE id=$1 AND owner_id=$2")
+        .bind(collection_id)
+        .bind(&user.id)
+        .execute(&state.db)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound("Collection not found".into()));
+    }
+    Ok(Json(json!({"success":true})))
+}
+
+async fn add_board_to_collection(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Path((collection_id, board_id)): Path<(String, String)>,
+) -> AppResult<Json<Value>> {
+    let user = session::require_current_user(&cookies, &state).await?;
+    require_private_collections_pro(&state.db, &user.id).await?;
+    require_owned_collection(&state.db, &collection_id, &user.id).await?;
+    authz::require_board_role(&state.db, &board_id, &user.id, BoardRole::Owner).await?;
+    sqlx::query(
+        "INSERT INTO private_collection_boards(owner_id,board_id,collection_id)
+         VALUES($1,$2,$3)
+         ON CONFLICT(owner_id,board_id) DO UPDATE SET collection_id=EXCLUDED.collection_id",
+    )
+    .bind(&user.id)
+    .bind(&board_id)
+    .bind(&collection_id)
+    .execute(&state.db)
+    .await?;
+    Ok(Json(json!({"success":true})))
+}
+
+async fn remove_board_from_collection(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Path((collection_id, board_id)): Path<(String, String)>,
+) -> AppResult<Json<Value>> {
+    let user = session::require_current_user(&cookies, &state).await?;
+    require_private_collections_pro(&state.db, &user.id).await?;
+    require_owned_collection(&state.db, &collection_id, &user.id).await?;
+    sqlx::query(
+        "DELETE FROM private_collection_boards
+         WHERE owner_id=$1 AND board_id=$2 AND collection_id=$3",
+    )
+    .bind(&user.id)
+    .bind(board_id)
+    .bind(collection_id)
+    .execute(&state.db)
+    .await?;
     Ok(Json(json!({"success":true})))
 }
 
