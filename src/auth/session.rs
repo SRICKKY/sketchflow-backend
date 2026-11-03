@@ -57,7 +57,15 @@ pub async fn optional_current_user(
     };
     let claims = match jwt::verify_token(cookie.value(), &state.config.jwt_secret) {
         Ok(claims) => claims,
-        Err(_) => return Ok(None),
+        Err(_) => {
+            tracing::warn!(
+                subsystem = "auth",
+                event = "token_validation_failed",
+                reason = "invalid_or_expired",
+                "Session token validation failed"
+            );
+            return Ok(None);
+        }
     };
     let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
         .bind(&claims.sub)

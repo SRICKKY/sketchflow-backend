@@ -101,7 +101,12 @@ pub async fn download_invoice_pdf(
                 .into_response();
         }
         Err(err) => {
-            tracing::error!(error = %err, "failed to resolve session");
+            tracing::error!(
+                subsystem = "auth",
+                event = "invoice_session_resolution_failed",
+                error = %err,
+                "Failed to resolve invoice session"
+            );
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
         }
     };
@@ -110,7 +115,12 @@ pub async fn download_invoice_pdf(
     {
         Ok(invoice) => invoice,
         Err(err) => {
-            tracing::error!(error = %err, "failed to load invoice");
+            tracing::error!(
+                subsystem = "database",
+                event = "invoice_load_failed",
+                error = %err,
+                "Failed to load invoice"
+            );
             return (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response();
         }
     };

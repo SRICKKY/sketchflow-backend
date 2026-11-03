@@ -222,6 +222,13 @@ fn oauth_error_redirect(
     error: &str,
     provider: &str,
 ) -> AppResult<Redirect> {
+    tracing::warn!(
+        subsystem = "auth",
+        event = "oauth_authentication_failed",
+        provider,
+        reason = error,
+        "OAuth authentication failed"
+    );
     let path = if mode == "register" {
         "/register"
     } else {
@@ -385,7 +392,15 @@ pub async fn login(
     AppJson(body): AppJson<LoginRequest>,
 ) -> AppResult<Json<AuthResponse>> {
     let email = normalize_email(&body.email);
-    let invalid = || AppError::Unauthorized("Invalid email or password.".to_string());
+    let invalid = || {
+        tracing::warn!(
+            subsystem = "auth",
+            event = "login_failed",
+            reason = "invalid_credentials",
+            "Login failed"
+        );
+        AppError::Unauthorized("Invalid email or password.".to_string())
+    };
 
     let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE email = $1")
         .bind(&email)
@@ -401,6 +416,12 @@ pub async fn login(
     }
 
     session::set_session_cookie(&cookies, &state, &user.id)?;
+    tracing::info!(
+        subsystem = "auth",
+        event = "login_succeeded",
+        user_id = %user.id,
+        "Login succeeded"
+    );
 
     Ok(Json(AuthResponse { user: user.into() }))
 }
@@ -565,7 +586,13 @@ pub async fn google_callback(
         match google_user_info(code, client_id, client_secret, code_verifier, &state).await {
             Ok(profile) => profile,
             Err(error) => {
-                tracing::warn!(error = %error, "Google OAuth user info request failed");
+                tracing::warn!(
+                    subsystem = "auth",
+                    event = "oauth_profile_request_failed",
+                    provider = "google",
+                    %error,
+                    "Google OAuth user info request failed"
+                );
                 return google_error_redirect(
                     &state,
                     &oauth_state.mode,
@@ -587,7 +614,13 @@ pub async fn google_callback(
     {
         Ok(user) => user,
         Err(error) => {
-            tracing::error!(error = ?error, "Google OAuth account provisioning failed");
+            tracing::error!(
+                subsystem = "auth",
+                event = "oauth_account_provisioning_failed",
+                provider = "google",
+                error = %error,
+                "Google OAuth account provisioning failed"
+            );
             let code = if matches!(error, AppError::Conflict(_)) {
                 "account_exists"
             } else {
@@ -597,6 +630,13 @@ pub async fn google_callback(
         }
     };
     session::set_session_cookie(&cookies, &state, &user.id)?;
+    tracing::info!(
+        subsystem = "auth",
+        event = "oauth_login_succeeded",
+        provider = "google",
+        user_id = %user.id,
+        "OAuth login succeeded"
+    );
     let destination = frontend_url(&state, &oauth_state.return_to)?;
     Ok(Redirect::temporary(destination.as_str()))
 }
@@ -718,7 +758,13 @@ pub async fn github_callback(
     let profile = match github_user_info(code, client_id, client_secret, &state).await {
         Ok(profile) => profile,
         Err(error) => {
-            tracing::warn!(error = %error, "GitHub OAuth user info request failed");
+            tracing::warn!(
+                subsystem = "auth",
+                event = "oauth_profile_request_failed",
+                provider = "github",
+                %error,
+                "GitHub OAuth user info request failed"
+            );
             return github_error_redirect(
                 &state,
                 &oauth_state.mode,
@@ -740,7 +786,13 @@ pub async fn github_callback(
     {
         Ok(user) => user,
         Err(error) => {
-            tracing::error!(error = ?error, "GitHub OAuth account provisioning failed");
+            tracing::error!(
+                subsystem = "auth",
+                event = "oauth_account_provisioning_failed",
+                provider = "github",
+                error = %error,
+                "GitHub OAuth account provisioning failed"
+            );
             let code = if matches!(error, AppError::Conflict(_)) {
                 "account_exists"
             } else {
@@ -750,6 +802,13 @@ pub async fn github_callback(
         }
     };
     session::set_session_cookie(&cookies, &state, &user.id)?;
+    tracing::info!(
+        subsystem = "auth",
+        event = "oauth_login_succeeded",
+        provider = "github",
+        user_id = %user.id,
+        "OAuth login succeeded"
+    );
     let destination = frontend_url(&state, &oauth_state.return_to)?;
     Ok(Redirect::temporary(destination.as_str()))
 }
@@ -782,11 +841,20 @@ async fn google_user_info(
         .send()
         .await
         .map_err(|error| {
-            tracing::warn!(error = %error, "Google OAuth token exchange failed");
+            tracing::warn!(
+                subsystem = "auth",
+                event = "oauth_token_exchange_failed",
+                provider = "google",
+                %error,
+                "Google OAuth token exchange failed"
+            );
             AppError::Gateway(502, "Google sign-in could not be completed.".to_string())
         })?;
     if !token_response.status().is_success() {
         tracing::warn!(
+            subsystem = "auth",
+            event = "oauth_token_exchange_rejected",
+            provider = "google",
             status = %token_response.status(),
             "Google OAuth token exchange was rejected"
         );
@@ -799,7 +867,13 @@ async fn google_user_info(
         .json::<GoogleTokenResponse>()
         .await
         .map_err(|error| {
-            tracing::warn!(error = %error, "Google OAuth token response was invalid");
+            tracing::warn!(
+                subsystem = "auth",
+                event = "oauth_token_response_invalid",
+                provider = "google",
+                %error,
+                "Google OAuth token response was invalid"
+            );
             AppError::Gateway(502, "Google sign-in could not be completed.".to_string())
         })?;
 
@@ -809,11 +883,20 @@ async fn google_user_info(
         .send()
         .await
         .map_err(|error| {
-            tracing::warn!(error = %error, "Google user info request failed");
+            tracing::warn!(
+                subsystem = "auth",
+                event = "oauth_profile_request_failed",
+                provider = "google",
+                %error,
+                "Google user info request failed"
+            );
             AppError::Gateway(502, "Google sign-in could not be completed.".to_string())
         })?;
     if !profile_response.status().is_success() {
         tracing::warn!(
+            subsystem = "auth",
+            event = "oauth_profile_request_rejected",
+            provider = "google",
             status = %profile_response.status(),
             "Google user info request was rejected"
         );
@@ -826,7 +909,13 @@ async fn google_user_info(
         .json::<GoogleUserInfo>()
         .await
         .map_err(|error| {
-            tracing::warn!(error = %error, "Google user info response was invalid");
+            tracing::warn!(
+                subsystem = "auth",
+                event = "oauth_profile_response_invalid",
+                provider = "google",
+                %error,
+                "Google user info response was invalid"
+            );
             AppError::Gateway(502, "Google sign-in could not be completed.".to_string())
         })?;
     if !profile.email_verified
@@ -866,11 +955,20 @@ async fn github_user_info(
         .send()
         .await
         .map_err(|error| {
-            tracing::warn!(error = %error, "GitHub OAuth token exchange failed");
+            tracing::warn!(
+                subsystem = "auth",
+                event = "oauth_token_exchange_failed",
+                provider = "github",
+                %error,
+                "GitHub OAuth token exchange failed"
+            );
             AppError::Gateway(502, "GitHub sign-in could not be completed.".to_string())
         })?;
     if !token_response.status().is_success() {
         tracing::warn!(
+            subsystem = "auth",
+            event = "oauth_token_exchange_rejected",
+            provider = "github",
             status = %token_response.status(),
             "GitHub OAuth token exchange was rejected"
         );
@@ -883,7 +981,13 @@ async fn github_user_info(
         .json::<GithubTokenResponse>()
         .await
         .map_err(|error| {
-            tracing::warn!(error = %error, "GitHub OAuth token response was invalid");
+            tracing::warn!(
+                subsystem = "auth",
+                event = "oauth_token_response_invalid",
+                provider = "github",
+                %error,
+                "GitHub OAuth token response was invalid"
+            );
             AppError::Gateway(502, "GitHub sign-in could not be completed.".to_string())
         })?;
 
@@ -896,11 +1000,20 @@ async fn github_user_info(
         .send()
         .await
         .map_err(|error| {
-            tracing::warn!(error = %error, "GitHub profile request failed");
+            tracing::warn!(
+                subsystem = "auth",
+                event = "oauth_profile_request_failed",
+                provider = "github",
+                %error,
+                "GitHub profile request failed"
+            );
             AppError::Gateway(502, "GitHub sign-in could not be completed.".to_string())
         })?;
     if !profile_response.status().is_success() {
         tracing::warn!(
+            subsystem = "auth",
+            event = "oauth_profile_request_rejected",
+            provider = "github",
             status = %profile_response.status(),
             "GitHub profile request was rejected"
         );
@@ -913,7 +1026,13 @@ async fn github_user_info(
         .json::<GithubProfile>()
         .await
         .map_err(|error| {
-            tracing::warn!(error = %error, "GitHub profile response was invalid");
+            tracing::warn!(
+                subsystem = "auth",
+                event = "oauth_profile_response_invalid",
+                provider = "github",
+                %error,
+                "GitHub profile response was invalid"
+            );
             AppError::Gateway(502, "GitHub sign-in could not be completed.".to_string())
         })?;
     if profile.id == 0 || profile.login.trim().is_empty() {
@@ -931,11 +1050,20 @@ async fn github_user_info(
         .send()
         .await
         .map_err(|error| {
-            tracing::warn!(error = %error, "GitHub email request failed");
+            tracing::warn!(
+                subsystem = "auth",
+                event = "oauth_email_request_failed",
+                provider = "github",
+                %error,
+                "GitHub email request failed"
+            );
             AppError::Gateway(502, "GitHub sign-in could not be completed.".to_string())
         })?;
     if !emails_response.status().is_success() {
         tracing::warn!(
+            subsystem = "auth",
+            event = "oauth_email_request_rejected",
+            provider = "github",
             status = %emails_response.status(),
             "GitHub email request was rejected"
         );
@@ -948,7 +1076,13 @@ async fn github_user_info(
         .json::<Vec<GithubEmail>>()
         .await
         .map_err(|error| {
-            tracing::warn!(error = %error, "GitHub email response was invalid");
+            tracing::warn!(
+                subsystem = "auth",
+                event = "oauth_email_response_invalid",
+                provider = "github",
+                %error,
+                "GitHub email response was invalid"
+            );
             AppError::Gateway(502, "GitHub sign-in could not be completed.".to_string())
         })?;
     let email = verified_primary_github_email(emails).ok_or_else(|| {

@@ -11,6 +11,7 @@ tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "trace", "limit", "fs"] }
 tower-cookies = "0.11"
+http-body-util = "0.1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -65,7 +66,7 @@ thiserror = "2"
 anyhow = "1"
 dotenvy = "0.15"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
 validator = { version = "0.21", features = ["derive"] }
 aws-config = { version = "=1.8.1", default-features = false, features = ["rt-tokio", "rustls"] }
 aws-credential-types = "=1.2.10"

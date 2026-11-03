@@ -6,7 +6,7 @@ use std::{
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        Extension, Path, State,
     },
     http::{header::ORIGIN, HeaderMap},
     response::Response,
@@ -25,6 +25,7 @@ use crate::{
     authz::{self, BoardRole},
     error::{AppError, AppResult},
     models::User,
+    request_logging::RequestId,
     state::AppState,
 };
 
@@ -150,9 +151,11 @@ impl CollaborationHub {
             let _ = room.send(message);
         } else if let Err(error) = self.publish(board_id, message.clone()).await {
             tracing::error!(
+                subsystem = "websocket",
+                event = "redis_access_revocation_publish_failed",
                 board_id,
                 %error,
-                "failed to publish board access revocation to Redis"
+                "Failed to publish board access revocation"
             );
             let _ = room.send(message);
         }
@@ -169,6 +172,15 @@ impl CollaborationHub {
 }
 
 /// Subscribes to shared collaboration events and reconnects with bounded backoff on failure.
+#[tracing::instrument(
+    skip_all,
+    fields(
+        service = "sketchflow-api",
+        environment = %crate::request_logging::app_environment(),
+        subsystem = "websocket",
+        component = "redis_subscriber"
+    )
+)]
 async fn run_redis_subscriber(
     client: RedisClient,
     mut subscriber: redis::aio::PubSub,
@@ -181,18 +193,23 @@ async fn run_redis_subscriber(
             match message.get_payload::<String>() {
                 Ok(payload) => match serde_json::from_str::<RedisEvent>(&payload) {
                     Ok(event) => hub.publish_local(&event.board_id, event.message).await,
-                    Err(error) => {
-                        tracing::warn!(%error, "ignoring malformed Redis collaboration event")
-                    }
+                    Err(error) => tracing::warn!(
+                        event = "redis_event_malformed",
+                        %error,
+                        "Ignoring malformed Redis collaboration event"
+                    ),
                 },
-                Err(error) => {
-                    tracing::warn!(%error, "ignoring invalid Redis collaboration payload")
-                }
+                Err(error) => tracing::warn!(
+                    event = "redis_payload_invalid",
+                    %error,
+                    "Ignoring invalid Redis collaboration payload"
+                ),
             }
         }
         drop(messages);
 
         tracing::warn!(
+            event = "redis_subscription_disconnected",
             retry_delay_ms = retry_delay.as_millis(),
             "Redis collaboration subscription disconnected; reconnecting"
         );
@@ -202,16 +219,27 @@ async fn run_redis_subscriber(
                 Ok(()) => {
                     subscriber = next_subscriber;
                     retry_delay = Duration::from_millis(500);
-                    tracing::info!("Redis collaboration subscription reconnected");
+                    tracing::info!(
+                        event = "redis_subscription_reconnected",
+                        "Redis collaboration subscription reconnected"
+                    );
                     hub.require_local_resync().await;
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "failed to resubscribe to Redis collaboration channel");
+                    tracing::warn!(
+                        event = "redis_resubscribe_failed",
+                        %error,
+                        "Failed to resubscribe to Redis collaboration channel"
+                    );
                     retry_delay = (retry_delay * 2).min(Duration::from_secs(15));
                 }
             },
             Err(error) => {
-                tracing::warn!(%error, "failed to reconnect Redis collaboration subscriber");
+                tracing::warn!(
+                    event = "redis_reconnect_failed",
+                    %error,
+                    "Failed to reconnect Redis collaboration subscriber"
+                );
                 retry_delay = (retry_delay * 2).min(Duration::from_secs(15));
             }
         }
@@ -368,16 +396,22 @@ pub async fn websocket(
     cookies: Cookies,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
+    request_id: Option<Extension<RequestId>>,
 ) -> AppResult<Response> {
     // WebSockets do not receive browser CORS enforcement, so validate Origin explicitly.
     validate_origin(&state, &headers)?;
     let user = session::require_current_user(&cookies, &state).await?;
     let access =
         authz::require_board_role(&state.db, &board_id, &user.id, BoardRole::Viewer).await?;
+    let request_id = request_id
+        .map(|Extension(request_id)| request_id.0)
+        .unwrap_or_else(crate::request_logging::generate_request_id);
     Ok(ws
         .max_message_size(MAX_MESSAGE_BYTES)
         .max_frame_size(MAX_MESSAGE_BYTES)
-        .on_upgrade(move |socket| handle_socket(socket, state, board_id, user, access.role)))
+        .on_upgrade(move |socket| {
+            handle_socket(socket, state, board_id, user, access.role, request_id)
+        }))
 }
 
 /// Rejects browser WebSocket handshakes from origins outside the configured allowlist.
@@ -400,20 +434,42 @@ fn validate_origin(state: &AppState, headers: &HeaderMap) -> AppResult<()> {
     }
 }
 
+#[tracing::instrument(
+    skip_all,
+    fields(
+        service = "sketchflow-api",
+        environment = %crate::request_logging::app_environment(),
+        request_id = %request_id,
+        subsystem = "websocket",
+        board_id = %board_id,
+        user_id = %user.id,
+        connection_id = tracing::field::Empty
+    )
+)]
 async fn handle_socket(
     mut socket: WebSocket,
     state: AppState,
     board_id: String,
     user: User,
     role: BoardRole,
+    request_id: String,
 ) {
+    let connection_started = Instant::now();
     let connection_id = cuid2::create_id();
+    tracing::Span::current().record("connection_id", tracing::field::display(&connection_id));
+    tracing::info!(event = "connection_started", "WebSocket connection started");
     // Subscribe before reading the snapshot so updates arriving during sync are buffered.
     let (room_tx, mut room_rx) = state.collaboration.subscribe(&board_id).await;
 
     let snapshot = match load_snapshot(&state, &board_id).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
+            tracing::warn!(
+                event = "connection_failed",
+                reason = "snapshot_failed",
+                %error,
+                "WebSocket connection setup failed"
+            );
             let _ = send_message(
                 &mut socket,
                 &ServerMessage::Error {
@@ -448,6 +504,11 @@ async fn handle_socket(
         .await
         .is_err()
     {
+        tracing::warn!(
+            event = "connection_failed",
+            reason = "initial_sync_failed",
+            "WebSocket initial synchronization failed"
+        );
         drop(room_rx);
         state
             .collaboration
@@ -468,6 +529,7 @@ async fn handle_socket(
         },
     )
     .await;
+    tracing::info!(event = "connection_established", "WebSocket connected");
 
     let (mut socket_sender, mut socket_receiver) = socket.split();
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Message>(64);
@@ -488,10 +550,12 @@ async fn handle_socket(
     let mut authorization_check = tokio::time::interval(Duration::from_secs(30));
     authorization_check.tick().await;
 
+    let mut disconnect_reason = "socket_ended";
     loop {
         tokio::select! {
             incoming = socket_receiver.next() => {
                 let Some(Ok(message)) = incoming else {
+                    disconnect_reason = "socket_closed_or_receive_failed";
                     break;
                 };
                 last_activity = Instant::now();
@@ -504,6 +568,11 @@ async fn handle_socket(
                         }
                         messages_in_window += 1;
                         if messages_in_window > MAX_MESSAGES_PER_SECOND {
+                            disconnect_reason = "rate_limited";
+                            tracing::warn!(
+                                event = "collaboration_rate_limited",
+                                "Collaboration client exceeded its message rate"
+                            );
                             let _ = queue_message(&outgoing_tx, &ServerMessage::Error {
                                 message: "Too many collaboration messages.".to_string(),
                             });
@@ -513,6 +582,12 @@ async fn handle_socket(
                         let envelope = match serde_json::from_str::<Value>(text.as_str()) {
                             Ok(value) => value,
                             Err(_) => {
+                                tracing::warn!(
+                                    event = "collaboration_message_rejected",
+                                    reason = "invalid_json",
+                                    payload_bytes = text.len(),
+                                    "Rejected malformed collaboration message"
+                                );
                                 if !queue_message(&outgoing_tx, &ServerMessage::Error {
                                     message: "Invalid collaboration message.".to_string(),
                                 }) {
@@ -526,6 +601,11 @@ async fn handle_socket(
                             .and_then(Value::as_u64)
                             != Some(PROTOCOL_VERSION)
                         {
+                            tracing::warn!(
+                                event = "collaboration_message_rejected",
+                                reason = "unsupported_protocol_version",
+                                "Rejected unsupported collaboration protocol version"
+                            );
                             if !queue_message(&outgoing_tx, &ServerMessage::Error {
                                 message: "Unsupported collaboration protocol version.".to_string(),
                             }) {
@@ -537,6 +617,11 @@ async fn handle_socket(
                         let client_message = match serde_json::from_value::<ClientMessage>(envelope) {
                             Ok(message) => message,
                             Err(_) => {
+                                tracing::warn!(
+                                    event = "collaboration_message_rejected",
+                                    reason = "invalid_message_shape",
+                                    "Rejected invalid collaboration message"
+                                );
                                 if !queue_message(&outgoing_tx, &ServerMessage::Error {
                                     message: "Invalid collaboration message.".to_string(),
                                 }) {
@@ -545,6 +630,18 @@ async fn handle_socket(
                                 continue;
                             }
                         };
+                        let message_type = match &client_message {
+                            ClientMessage::ApplyOperation { .. } => "apply_operation",
+                            ClientMessage::Preview { .. } => "preview",
+                            ClientMessage::Presence { .. } => "presence",
+                            ClientMessage::Ping => "ping",
+                        };
+                        tracing::debug!(
+                            event = "collaboration_event_received",
+                            message_type,
+                            payload_bytes = text.len(),
+                            "Collaboration event received"
+                        );
                         match client_message {
                             ClientMessage::ApplyOperation { client_operation_id, base_revision, batch } => {
                                 // Reject viewers early, then re-check database authorization before each write.
@@ -584,18 +681,33 @@ async fn handle_socket(
                                 };
                                 match operation {
                                     // Persist before publishing so peers never observe an uncommitted change.
-                                    Ok(operation) => publish_message(
-                                        &state.collaboration,
-                                        &board_id,
-                                        &room_tx,
-                                        &ServerMessage::OperationApplied {
-                                            revision: operation.revision,
-                                            client_operation_id: operation.client_operation_id,
-                                            actor_id: operation.actor_id,
-                                            batch: operation.batch,
-                                        },
-                                    ).await,
+                                    Ok(operation) => {
+                                        tracing::info!(
+                                            event = "collaboration_operation_applied",
+                                            revision = operation.revision,
+                                            upsert_count = operation.batch.upserts.len(),
+                                            delete_count = operation.batch.deleted_ids.len(),
+                                            replayed = operation.replayed,
+                                            "Collaboration operation applied"
+                                        );
+                                        publish_message(
+                                            &state.collaboration,
+                                            &board_id,
+                                            &room_tx,
+                                            &ServerMessage::OperationApplied {
+                                                revision: operation.revision,
+                                                client_operation_id: operation.client_operation_id,
+                                                actor_id: operation.actor_id,
+                                                batch: operation.batch,
+                                            },
+                                        ).await
+                                    }
                                     Err(error) => {
+                                        tracing::warn!(
+                                            event = "collaboration_operation_failed",
+                                            reason = "operation_rejected_or_persistence_failed",
+                                            "Collaboration operation failed"
+                                        );
                                         if !queue_message(&outgoing_tx, &ServerMessage::Error {
                                             message: error.to_string(),
                                         }) {
@@ -670,8 +782,16 @@ async fn handle_socket(
                             break;
                         }
                     }
-                    Message::Close(_) => break,
+                    Message::Close(_) => {
+                        disconnect_reason = "client_closed";
+                        break;
+                    }
                     Message::Binary(_) => {
+                        tracing::warn!(
+                            event = "collaboration_message_rejected",
+                            reason = "binary_message_unsupported",
+                            "Rejected binary collaboration message"
+                        );
                         if !queue_message(&outgoing_tx, &ServerMessage::Error {
                             message: "Binary collaboration messages are not supported.".to_string(),
                         }) {
@@ -684,21 +804,32 @@ async fn handle_socket(
             _ = authorization_check.tick() => {
                 match authz::get_board_access(&state.db, &board_id, &user.id).await {
                     Ok(Some(access)) if access.role >= BoardRole::Viewer => {}
-                    Ok(_) => break,
+                    Ok(_) => {
+                        disconnect_reason = "authorization_revoked";
+                        tracing::info!(
+                            event = "connection_authorization_revoked",
+                            "Closing collaboration connection after access revocation"
+                        );
+                        break;
+                    }
                     Err(error) => {
                         tracing::warn!(
-                            board_id,
-                            user_id = %user.id,
+                            event = "connection_authorization_check_failed",
                             error = %error,
-                            "failed to refresh collaboration authorization"
+                            "Failed to refresh collaboration authorization"
                         );
+                        disconnect_reason = "authorization_check_failed";
                         break;
                     }
                 }
             }
             _ = heartbeat_check.tick() => {
                 if last_activity.elapsed() > Duration::from_secs(60) {
-                    tracing::info!(board_id, user_id = %user.id, "closing inactive collaboration connection");
+                    tracing::info!(
+                        event = "connection_idle_timeout",
+                        "Closing inactive collaboration connection"
+                    );
+                    disconnect_reason = "idle_timeout";
                     break;
                 }
             }
@@ -714,10 +845,18 @@ async fn handle_socket(
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         // A slow socket may have missed events; disconnect it so it can resync.
+                        disconnect_reason = "client_lagged";
+                        tracing::warn!(
+                            event = "connection_client_lagged",
+                            "Disconnecting slow collaboration client"
+                        );
                         let _ = queue_message(&outgoing_tx, &ServerMessage::ResyncRequired);
                         break;
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        disconnect_reason = "room_closed";
+                        break;
+                    }
                 }
             }
         }
@@ -733,6 +872,12 @@ async fn handle_socket(
         },
     )
     .await;
+    tracing::info!(
+        event = "connection_disconnected",
+        reason = disconnect_reason,
+        duration_ms = connection_started.elapsed().as_millis() as u64,
+        "WebSocket disconnected"
+    );
     drop(outgoing_tx);
     writer_task.abort();
     let _ = writer_task.await;
@@ -954,9 +1099,11 @@ async fn publish_message(
     // With Redis, this instance's subscriber delivers the event locally as well as remotely.
     if let Err(error) = hub.publish(board_id, json).await {
         tracing::error!(
+            subsystem = "websocket",
+            event = "collaboration_event_publish_failed",
             board_id,
             %error,
-            "failed to publish collaboration event to Redis; local clients must resync"
+            "Failed to publish collaboration event; local clients must resync"
         );
         let resync = serialize_server_message(&ServerMessage::ResyncRequired);
         let _ = local_sender.send(resync);

@@ -62,7 +62,28 @@ impl AppError {
                 msg.clone(),
             ),
             AppError::Internal(err) => {
-                tracing::error!(error = %err, "internal server error");
+                if let Some(database_error) = err.downcast_ref::<sqlx::Error>() {
+                    let event = match database_error {
+                        sqlx::Error::PoolTimedOut => "pool_exhausted",
+                        sqlx::Error::PoolClosed | sqlx::Error::Io(_) | sqlx::Error::Tls(_) => {
+                            "connection_failed"
+                        }
+                        _ => "query_failed",
+                    };
+                    tracing::error!(
+                        subsystem = "database",
+                        event,
+                        error = %database_error,
+                        "Database operation failed"
+                    );
+                } else {
+                    tracing::error!(
+                        subsystem = "api",
+                        event = "internal_error",
+                        error = %err,
+                        "Internal server error"
+                    );
+                }
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Internal server error".to_string(),

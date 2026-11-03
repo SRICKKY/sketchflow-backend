@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Instant;
 
 use axum::{body::Bytes, extract::State, http::HeaderMap, Json};
 use chrono::Utc;
@@ -16,6 +17,59 @@ use crate::{
     extract::AppJson,
     state::AppState,
 };
+
+struct PaymentAttempt {
+    provider: String,
+    operation: &'static str,
+    started: Instant,
+    event_type: Option<String>,
+    succeeded: bool,
+}
+
+impl PaymentAttempt {
+    fn new(provider: impl Into<String>, operation: &'static str) -> Self {
+        Self {
+            provider: provider.into(),
+            operation,
+            started: Instant::now(),
+            event_type: None,
+            succeeded: false,
+        }
+    }
+
+    fn set_event_type(&mut self, event_type: &str) {
+        self.event_type = Some(event_type.to_owned());
+    }
+
+    fn succeed(mut self) {
+        self.succeeded = true;
+        tracing::info!(
+            subsystem = "payments",
+            event = "payment_operation_succeeded",
+            provider = %self.provider,
+            operation = self.operation,
+            event_type = self.event_type.as_deref().unwrap_or("none"),
+            duration_ms = self.started.elapsed().as_millis() as u64,
+            "Payment operation succeeded"
+        );
+    }
+}
+
+impl Drop for PaymentAttempt {
+    fn drop(&mut self) {
+        if !self.succeeded {
+            tracing::warn!(
+                subsystem = "payments",
+                event = "payment_operation_failed",
+                provider = %self.provider,
+                operation = self.operation,
+                event_type = self.event_type.as_deref().unwrap_or("unknown"),
+                duration_ms = self.started.elapsed().as_millis() as u64,
+                "Payment operation failed"
+            );
+        }
+    }
+}
 
 #[derive(Debug, Default, Deserialize, utoipa::ToSchema)]
 pub struct CreateOrderRequest {
@@ -201,6 +255,7 @@ pub async fn create_order(
     cookies: Cookies,
     AppJson(body): AppJson<CreateOrderRequest>,
 ) -> AppResult<Json<CreateOrderResponse>> {
+    let attempt = PaymentAttempt::new(&state.config.payment_gateway, "checkout_creation");
     let user = session::optional_current_user(&cookies, &state)
         .await?
         .ok_or_else(|| AppError::Unauthorized("Sign in to upgrade to Pro.".to_string()))?;
@@ -235,6 +290,7 @@ pub async fn create_order(
             switching_from_monthly,
         )
         .await?;
+        attempt.succeed();
         return Ok(Json(CreateOrderResponse {
             gateway: "paddle".to_string(),
             id: None,
@@ -293,6 +349,7 @@ pub async fn create_order(
     )
     .await?;
 
+    attempt.succeed();
     Ok(Json(CreateOrderResponse {
         gateway: "razorpay".to_string(),
         id: Some(order.id),
@@ -375,6 +432,7 @@ pub async fn verify_paddle_payment(
     cookies: Cookies,
     AppJson(body): AppJson<PaddleVerifyPaymentRequest>,
 ) -> AppResult<Json<billing::paddle::PaddleCompletion>> {
+    let attempt = PaymentAttempt::new("paddle", "payment_verification");
     let user = session::optional_current_user(&cookies, &state)
         .await?
         .ok_or_else(|| AppError::Unauthorized("Sign in to verify payment.".to_string()))?;
@@ -392,6 +450,7 @@ pub async fn verify_paddle_payment(
         Some(&user.id),
     )
     .await?;
+    attempt.succeed();
     Ok(Json(completion))
 }
 
@@ -416,6 +475,7 @@ pub async fn paddle_webhook(
     headers: HeaderMap,
     raw_body: Bytes,
 ) -> AppResult<Json<PaddleWebhookResponse>> {
+    let mut attempt = PaymentAttempt::new("paddle", "webhook_processing");
     let signature = headers
         .get("Paddle-Signature")
         .and_then(|value| value.to_str().ok())
@@ -429,7 +489,13 @@ pub async fn paddle_webhook(
 
     let event: Value = serde_json::from_slice(&raw_body)
         .map_err(|_| AppError::BadRequest("Paddle webhook payload is invalid.".into()))?;
-    if event.get("event_type").and_then(Value::as_str) == Some("transaction.completed") {
+    let event_type = event.get("event_type").and_then(Value::as_str);
+    if event_type == Some("transaction.completed") {
+        attempt.set_event_type("transaction.completed");
+    } else if event_type.is_some() {
+        attempt.set_event_type("other");
+    }
+    if event_type == Some("transaction.completed") {
         let transaction_id = event
             .get("data")
             .and_then(|data| data.get("id"))
@@ -442,6 +508,7 @@ pub async fn paddle_webhook(
             .await?;
     }
 
+    attempt.succeed();
     Ok(Json(PaddleWebhookResponse { received: true }))
 }
 
@@ -463,6 +530,7 @@ pub async fn verify_payment(
     cookies: Cookies,
     AppJson(body): AppJson<VerifyPaymentRequest>,
 ) -> AppResult<Json<VerifyPaymentResponse>> {
+    let attempt = PaymentAttempt::new("razorpay", "payment_verification");
     let user = session::optional_current_user(&cookies, &state)
         .await?
         .ok_or_else(|| AppError::Unauthorized("Sign in to verify payment.".to_string()))?;
@@ -533,6 +601,7 @@ pub async fn verify_payment(
     )
     .await?;
 
+    attempt.succeed();
     Ok(Json(VerifyPaymentResponse {
         success: true,
         status: payment.status,
