@@ -21,6 +21,7 @@ services:
       S3_BUCKET: ${S3_BUCKET:-sketchflow-assets}
       S3_REGION: ${S3_REGION:-us-east-1}
       S3_ENDPOINT_URL: http://silo:9000
+      S3_PUBLIC_ENDPOINT_URL: ${S3_PUBLIC_ENDPOINT_URL:-http://localhost:9000}
       S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-sketchflow}
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-local-silo-development-only}
       RUST_LOG: ${RUST_LOG:-sketchflow_backend=debug,tower_http=info}
@@ -91,6 +92,10 @@ services:
       - |
         mcli alias set local http://silo:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
         mcli mb --ignore-existing "local/$$S3_BUCKET"
+        cat > /tmp/sketchflow-cors.json <<'EOF'
+        {"CORSRules":[{"AllowedOrigins":["http://localhost:3000","http://localhost:8081","http://localhost:8082"],"AllowedMethods":["PUT"],"AllowedHeaders":["*"],"ExposeHeaders":["ETag"],"MaxAgeSeconds":3600}]}
+        EOF
+        mcli cors set "local/$$S3_BUCKET" /tmp/sketchflow-cors.json
     environment:
       MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-sketchflow}
       MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-local-silo-development-only}
