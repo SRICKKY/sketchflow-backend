@@ -11,6 +11,7 @@ tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "trace", "limit", "fs"] }
 tower-cookies = "0.11"
+http-body-util = "0.1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

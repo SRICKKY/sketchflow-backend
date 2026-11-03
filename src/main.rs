@@ -10,6 +10,7 @@ mod extract;
 mod models;
 mod openapi;
 mod profile;
+mod request_logging;
 mod routes;
 mod state;
 
@@ -18,6 +19,7 @@ use std::time::Duration;
 
 use axum::{
     extract::DefaultBodyLimit,
+    middleware,
     routing::{get, patch, post},
     Router,
 };
@@ -187,6 +189,7 @@ async fn main() {
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .layer(CookieManagerLayer::new())
+        .layer(middleware::from_fn(request_logging::log_request_payload))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr)
