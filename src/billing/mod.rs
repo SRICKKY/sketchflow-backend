@@ -474,13 +474,100 @@ pub struct InvoiceRecord {
     pub gateway_payment_id: Option<String>,
 }
 
+#[derive(sqlx::FromRow)]
+struct SubscriptionInvoiceSource {
+    id: String,
+    interval: String,
+    starts_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    payment_id: String,
+    gateway_order_id: Option<String>,
+    gateway_payment_id: Option<String>,
+}
+
+async fn backfill_invoices_for_user(
+    db: &PgPool,
+    config: &AppConfig,
+    user_id: &str,
+) -> Result<(), AppError> {
+    let subscriptions = sqlx::query_as::<_, SubscriptionInvoiceSource>(
+        r#"SELECT id, interval, starts_at, expires_at, payment_id,
+                  gateway_order_id, gateway_payment_id
+           FROM subscriptions
+           WHERE user_id = $1
+           ORDER BY starts_at ASC"#,
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await?;
+
+    for subscription in subscriptions {
+        let interval = BillingInterval::parse(&subscription.interval);
+        let payment_id = subscription
+            .gateway_payment_id
+            .as_deref()
+            .unwrap_or(&subscription.payment_id);
+        let invoice_id = cuid2::create_id();
+        let number = invoice_number(subscription.starts_at, &subscription.id);
+        sqlx::query(
+            r#"INSERT INTO invoices
+               (id, user_id, subscription_id, number, interval, amount_minor, currency,
+                status, paid_at, period_start, period_end, gateway_order_id, gateway_payment_id)
+               SELECT $1, $2, $3, $4, $5, $6, 'INR', 'paid', $7, $7, $8, $9, $10
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM invoices
+                   WHERE subscription_id = $3 OR gateway_payment_id = $10
+               )
+               ON CONFLICT DO NOTHING"#,
+        )
+        .bind(invoice_id)
+        .bind(user_id)
+        .bind(&subscription.id)
+        .bind(number)
+        .bind(interval.as_str())
+        .bind(checkout_amount_minor(config, interval))
+        .bind(subscription.starts_at)
+        .bind(subscription.expires_at)
+        .bind(subscription.gateway_order_id.as_deref())
+        .bind(payment_id)
+        .execute(db)
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Return a user's invoices, creating missing records for prior subscriptions
+/// so historical payments remain downloadable.
+pub async fn list_invoices_for_user(
+    db: &PgPool,
+    config: &AppConfig,
+    user_id: &str,
+) -> Result<Vec<InvoiceRecord>, AppError> {
+    backfill_invoices_for_user(db, config, user_id).await?;
+    let invoices = sqlx::query_as::<_, InvoiceRecord>(
+        r#"SELECT id, number, interval, amount_minor, currency, status, paid_at,
+                  period_start, period_end, gateway_order_id, gateway_payment_id
+           FROM invoices
+           WHERE user_id = $1
+           ORDER BY paid_at DESC, id DESC"#,
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await?;
+
+    Ok(invoices)
+}
+
 /// Fetch an invoice by id, scoped to the requesting user. Mirrors
 /// `getInvoiceForUser` from `server/billing.ts`.
 pub async fn get_invoice_for_user(
     db: &PgPool,
+    config: &AppConfig,
     user_id: &str,
     invoice_id: &str,
 ) -> Result<Option<InvoiceRecord>, AppError> {
+    backfill_invoices_for_user(db, config, user_id).await?;
     let invoice = sqlx::query_as::<_, InvoiceRecord>(
         r#"SELECT id, number, interval, amount_minor, currency, status, paid_at,
                   period_start, period_end, gateway_order_id, gateway_payment_id
