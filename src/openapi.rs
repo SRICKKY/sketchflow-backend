@@ -36,6 +36,7 @@ use crate::routes::{
         auth::github_callback,
         auth::logout,
         auth::get_session,
+        billing::billing_overview,
         billing::annual_upgrade_quote,
         billing::create_order,
         billing::verify_payment,
@@ -54,6 +55,7 @@ use crate::routes::{
         notifications::unread_notification_count,
         notifications::mark_notification_read,
         notifications::mark_all_notifications_read,
+        invoices::list_invoices,
         invoices::download_invoice_pdf
     ),
     components(schemas(
@@ -65,6 +67,7 @@ use crate::routes::{
         auth::LogoutResponse,
         billing::CreateOrderRequest,
         billing::CreateOrderResponse,
+        billing::BillingOverviewResponse,
         billing::AnnualUpgradeQuoteResponse,
         billing::VerifyPaymentRequest,
         billing::VerifyPaymentResponse,
@@ -88,6 +91,7 @@ use crate::routes::{
         notifications::MarkReadResponse,
         notifications::MarkAllReadInput,
         notifications::MarkAllReadResponse,
+        invoices::InvoiceResponse,
         crate::models::PublicUser
     ))
 )]

@@ -59,6 +59,49 @@ pub struct AnnualUpgradeQuoteResponse {
     pub currency: Option<String>,
 }
 
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BillingOverviewResponse {
+    pub status: String,
+    pub plan: String,
+    pub interval: Option<String>,
+    pub starts_at: Option<String>,
+    pub expires_at: Option<String>,
+}
+
+/// Return the signed-in user's current billing period and plan status.
+#[utoipa::path(
+    get,
+    path = "/api/billing/overview",
+    tag = "billing",
+    responses(
+        (status = 200, description = "Billing overview", body = BillingOverviewResponse),
+        (status = 401, description = "Not signed in")
+    )
+)]
+pub async fn billing_overview(
+    State(state): State<AppState>,
+    cookies: Cookies,
+) -> AppResult<Json<BillingOverviewResponse>> {
+    let user = session::optional_current_user(&cookies, &state)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("Sign in to view billing.".to_string()))?;
+    let billing = get_billing_state(&state.db, &user.id).await?;
+    let status = match billing.status {
+        BillingStatus::Free => "free",
+        BillingStatus::Active => "active",
+        BillingStatus::Expired => "expired",
+    };
+
+    Ok(Json(BillingOverviewResponse {
+        status: status.to_string(),
+        plan: billing.plan.to_string(),
+        interval: billing.interval.map(|value| value.as_str().to_string()),
+        starts_at: billing.starts_at.map(|value| value.to_rfc3339()),
+        expires_at: billing.expires_at.map(|value| value.to_rfc3339()),
+    }))
+}
+
 /// Return an exact, read-only quote for an active monthly Pro user's annual upgrade.
 #[utoipa::path(
     get,

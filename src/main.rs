@@ -131,6 +131,14 @@ async fn main() {
             patch(routes::profile::update_profile_password),
         )
         .route(
+            "/api/billing/overview",
+            get(routes::billing::billing_overview),
+        )
+        .route(
+            "/api/billing/invoices",
+            get(routes::invoices::list_invoices),
+        )
+        .route(
             "/api/billing/annual-upgrade-quote",
             get(routes::billing::annual_upgrade_quote),
         )
