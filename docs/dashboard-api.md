@@ -93,14 +93,22 @@ preventing concurrent requests from bypassing limits or owner protections.
 | `POST /api/boards` | `{name?, workspaceId?, templateId?}` | 201 `BoardSummary` |
 | `GET /api/boards/{id}` | — | `BoardSummary`; viewer or higher |
 | `PATCH /api/boards/{id}` | `{name}` | `BoardSummary`; owner only |
-| `DELETE /api/boards/{id}` | — | `{success:true}`; owner only |
+| `DELETE /api/boards/{id}` | — | Move to Trash; owner only |
 | `POST /api/boards/{id}/duplicate` | `{name?, workspaceId?}` | 201 `BoardSummary`; source viewer or higher |
+| `PUT /api/boards/{id}/favorite` | — | Mark favorite; viewer or higher |
+| `DELETE /api/boards/{id}/favorite` | — | Remove favorite; viewer or higher |
+| `POST /api/trash/{id}/restore` | — | Restore; board owner only |
+| `DELETE /api/trash/{id}` | — | Permanently delete a trashed board; owner only |
 
 List query parameters:
 
 - `scope=owned` (default): caller-owned personal boards.
 - `scope=shared`: personal boards directly shared with the caller, excluding
   caller-owned boards.
+- `scope=favorites`: favorite boards the caller can currently access.
+- `scope=trash`: caller-owned boards in Trash.
+- `collectionId=<id>`: filter caller-owned boards by a private collection.
+  Requires an active Pro subscription and collection ownership.
 - `workspaceId=<id>`: list all boards in that workspace instead of the personal
   scope. Requires an active Pro workspace membership.
 - `q=<text>`: case-insensitive literal substring of the name, trimmed, at most
@@ -112,7 +120,8 @@ List query parameters:
   Invalid or malformed cursors return 400.
 
 Lists use descending `(updatedAt, id)` keyset pagination, including search,
-shared and workspace lists. `nextCursor` is `null` when there are no more rows.
+shared, favorites, Trash and workspace lists. `nextCursor` is `null` when there
+are no more rows.
 Keep scope, workspace and search unchanged while loading subsequent pages.
 Authorization and all list filters are reapplied on every page; a cursor grants
 no access. Cursors encode the timestamp and ID, not an offset. Concurrent edits
@@ -133,8 +142,27 @@ document starts at collaboration revision **0**, with no source operation log.
 They enforce the recipient owner's image cap (10 free, 100 Pro). They do not
 mutate the source board or its revision.
 
-Deleting a board cascades its members, elements, collaboration state and
-operation history. It does not delete unrelated/shared uploaded assets.
+Moving a board to Trash sets `deletedAt` and immediately revokes normal board
+access, including collaboration sockets. Trashed boards remain in the owner's
+Trash until restored or permanently deleted; they do not automatically expire.
+Permanent deletion cascades members, elements, collaboration state, favorites,
+collection placement and operation history. It does not delete
+unrelated/shared uploaded assets.
+
+`BoardSummary.isFavorite` is private to the caller and can include any
+accessible board. Private collections are also owner-private, but can contain
+only boards owned by the collection owner. Creating, listing and deleting
+collections, and placing boards in them, require an active Pro subscription
+(monthly or annual). If Pro expires, collection data is retained but its API
+remains locked until Pro becomes active again.
+
+| Method / endpoint | Request | Response / permission |
+| --- | --- | --- |
+| `GET /api/collections` | — | `{items: PrivateCollection[]}`; active Pro only |
+| `POST /api/collections` | `{name}` | 201 `PrivateCollection`; active Pro only |
+| `DELETE /api/collections/{id}` | — | `{success:true}`; owner and active Pro only |
+| `PUT /api/collections/{id}/boards/{boardId}` | — | Place/move an owned board; active Pro only |
+| `DELETE /api/collections/{id}/boards/{boardId}` | — | Remove an owned board; active Pro only |
 
 ### Board sharing
 

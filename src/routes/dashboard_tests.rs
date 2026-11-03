@@ -445,6 +445,99 @@ async fn dashboard_http_flows_and_authorization() {
     )
     .await;
     assert_eq!(shared["items"].as_array().unwrap().len(), 1);
+    request(
+        &app,
+        Some(&guest),
+        "PUT",
+        &format!("{path}/favorite"),
+        None,
+        200,
+    )
+    .await;
+    let favorites = request(
+        &app,
+        Some(&guest),
+        "GET",
+        "/api/boards?scope=favorites&q=Alpha",
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(favorites["items"].as_array().unwrap().len(), 1);
+    assert_eq!(favorites["items"][0]["isFavorite"], true);
+    request(
+        &app,
+        Some(&guest),
+        "DELETE",
+        &format!("{path}/favorite"),
+        None,
+        200,
+    )
+    .await;
+    request(&app, Some(&free), "GET", "/api/collections", None, 403).await;
+    request(&app, Some(&expired), "GET", "/api/collections", None, 403).await;
+    let collection = request(
+        &app,
+        Some(&pro),
+        "POST",
+        "/api/collections",
+        Some(json!({"name":"Research"})),
+        201,
+    )
+    .await;
+    assert_eq!(collection["name"], "Research");
+    let collection_id = collection["id"].as_str().unwrap();
+    let pro_board = request(
+        &app,
+        Some(&pro),
+        "POST",
+        "/api/boards",
+        Some(json!({"name":"Pro canvas"})),
+        201,
+    )
+    .await;
+    let pro_board_id = pro_board["id"].as_str().unwrap();
+    let collection_path = format!("/api/collections/{collection_id}");
+    let collection_board_path = format!("{collection_path}/boards/{pro_board_id}");
+    request(&app, Some(&pro), "PUT", &collection_board_path, None, 200).await;
+    let collection_boards = request(
+        &app,
+        Some(&pro),
+        "GET",
+        &format!("/api/boards?collectionId={collection_id}"),
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(collection_boards["items"].as_array().unwrap().len(), 1);
+    assert_eq!(collection_boards["items"][0]["id"], pro_board_id);
+    request(
+        &app,
+        Some(&admin_token),
+        "GET",
+        &format!("/api/boards?collectionId={collection_id}"),
+        None,
+        404,
+    )
+    .await;
+    request(
+        &app,
+        Some(&expired),
+        "POST",
+        "/api/collections",
+        Some(json!({"name":"Locked"})),
+        403,
+    )
+    .await;
+    request(&app, Some(&pro), "DELETE", &collection_path, None, 200).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM boards WHERE id=$1")
+            .bind(pro_board_id)
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        1
+    );
     let owner_members = request(
         &app,
         Some(&free),
@@ -955,7 +1048,91 @@ async fn dashboard_http_flows_and_authorization() {
         .unwrap(),
         0
     );
+    request(
+        &app,
+        Some(&free),
+        "DELETE",
+        &format!("/api/trash/{board_id}"),
+        None,
+        409,
+    )
+    .await;
     request(&app, Some(&free), "DELETE", &path, None, 200).await;
+    request(
+        &app,
+        Some(&free),
+        "GET",
+        &format!("{path}/detail"),
+        None,
+        404,
+    )
+    .await;
+    let active_after_trash = request(
+        &app,
+        Some(&free),
+        "GET",
+        "/api/boards?scope=owned&q=Alpha",
+        None,
+        200,
+    )
+    .await;
+    assert!(active_after_trash["items"].as_array().unwrap().is_empty());
+    let trash = request(
+        &app,
+        Some(&free),
+        "GET",
+        "/api/boards?scope=trash&q=Alpha",
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(trash["items"].as_array().unwrap().len(), 1);
+    assert_eq!(trash["items"][0]["id"], board_id);
+    request(
+        &app,
+        Some(&admin_token),
+        "POST",
+        &format!("/api/trash/{board_id}/restore"),
+        None,
+        403,
+    )
+    .await;
+    request(
+        &app,
+        Some(&free),
+        "POST",
+        &format!("/api/trash/{board_id}/restore"),
+        None,
+        200,
+    )
+    .await;
+    request(
+        &app,
+        Some(&free),
+        "GET",
+        &format!("{path}/detail"),
+        None,
+        200,
+    )
+    .await;
+    request(&app, Some(&free), "DELETE", &path, None, 200).await;
+    request(
+        &app,
+        Some(&free),
+        "DELETE",
+        &format!("/api/trash/{board_id}"),
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM boards WHERE id=$1")
+            .bind(board_id)
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        0
+    );
     let caps = request(&app, Some(&free), "GET", "/api/dashboard", None, 200).await;
     assert_eq!(caps["capabilities"]["canCreateBoard"], true);
     db.close().await;
