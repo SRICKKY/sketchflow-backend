@@ -14,6 +14,7 @@ mod routes;
 mod state;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -69,6 +70,22 @@ async fn main() {
         config: Arc::new(config.clone()),
         collaboration,
     };
+
+    let cleanup_db = state.db.clone();
+    let cleanup_config = state.config.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            match assets::cleanup_abandoned_uploads(&cleanup_db, &cleanup_config).await {
+                Ok(cleaned) if cleaned > 0 => {
+                    tracing::info!(cleaned, "cleaned abandoned image uploads");
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "failed to clean abandoned image uploads"),
+            }
+        }
+    });
 
     let origins: Vec<_> = config
         .cors_allowed_origins
@@ -131,9 +148,16 @@ async fn main() {
                 .layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
         )
         .route(
-            "/api/uploads",
-            post(routes::uploads::upload_image)
-                .layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
+            "/api/uploads/presign",
+            post(routes::uploads::presign_upload),
+        )
+        .route(
+            "/api/uploads/{asset_id}/complete",
+            post(routes::uploads::complete_upload),
+        )
+        .route(
+            "/api/uploads/{asset_id}/abort",
+            post(routes::uploads::abort_upload),
         )
         .route("/api/uploads/{asset_id}", get(routes::uploads::get_asset))
         .route(

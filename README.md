@@ -58,8 +58,9 @@ and authentication integration plan.
 Compose reads optional `JWT_SECRET`, `JWT_SESSION_DAYS`, `FRONTEND_BASE_URL`,
 `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GITHUB_CLIENT_ID`,
 `GITHUB_CLIENT_SECRET`, `CORS_ALLOWED_ORIGINS`, `BACKEND_PORT`, `S3_BUCKET`,
-`S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, and `RUST_LOG` values
-from your shell or backend `.env`. It deliberately ignores `DATABASE_URL` and
+`S3_REGION`, `S3_PUBLIC_ENDPOINT_URL`, `S3_ACCESS_KEY_ID`,
+`S3_SECRET_ACCESS_KEY`, and `RUST_LOG` values from your shell or backend `.env`.
+It deliberately ignores `DATABASE_URL` and
 `REDIS_URL` there and uses the local services instead. The Compose backend
 connects to Silo at `http://silo:9000`. The development database password,
 Silo credentials, and default JWT secret are **local-only defaults**, not
@@ -152,7 +153,7 @@ The server listens on `http://localhost:8080` by default.
 | Auth | `POST /api/auth/register`, `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/session` |
 | Billing | `POST /api/create-order`, `POST /api/verify-payment`, `POST /api/paddle/verify-payment`, `POST /api/paddle/webhook` |
 | Profile | `POST /api/profile/avatar`, `DELETE /api/profile/avatar` |
-| Uploads | `POST /api/uploads`, `GET /api/uploads/{assetId}` |
+| Uploads | `POST /api/uploads/presign`, `POST /api/uploads/{assetId}/complete`, `POST /api/uploads/{assetId}/abort`, `GET /api/uploads/{assetId}` |
 | Notifications | `GET /api/notifications`, `GET /api/notifications/unread-count`, `PATCH /api/notifications/{notificationId}`, `POST /api/notifications/read-all` |
 | Collaboration | `GET /api/boards/{boardId}/snapshot`, `GET /api/boards/{boardId}/collaboration` (WebSocket) |
 | Invoices | `GET /billing/{invoiceId}/pdf` |
@@ -240,15 +241,24 @@ collaboration operations. Enable collaborative editing only after clients
 write through this backend, or after all legacy write paths have been updated
 to participate in its revision and broadcast flow.
 
-Image and avatar uploads use S3-compatible storage when `S3_BUCKET` is
-configured. Set `S3_REGION`, credentials, and optionally `S3_ENDPOINT_URL` for
-services such as Silo; custom endpoints use path-style bucket addressing.
-Without `S3_BUCKET`, uploads continue to use local `ASSET_STORAGE_DIR`. Uploads
-store image objects under `assets/` plus JSON metadata sidecars, and the
-existing `GET /api/uploads/{assetId}` endpoint streams the image from storage.
-For local development, Compose configures Silo automatically. The Compose
+Board images upload directly from the browser to a private S3-compatible
+`S3_BUCKET` using short-lived presigned PUT URLs. The API checks the user's
+board role and plan limits, verifies completed objects with S3 `HeadObject` and
+image signatures, and stores upload status in PostgreSQL. Board-image downloads
+require viewer access to the associated board. Configure S3 CORS to allow
+`PUT` from each frontend origin and the signed request headers; keep the bucket
+private. Set `S3_REGION`, credentials, and optionally `S3_ENDPOINT_URL` for
+services such as Silo. Set `S3_PUBLIC_ENDPOINT_URL` only when the endpoint
+embedded in the presigned URL must differ from the backend's S3 endpoint.
+Custom endpoints use path-style bucket addressing.
+
+Avatars continue to use the backend upload endpoint and can fall back to local
+`ASSET_STORAGE_DIR` when S3 is not configured. For local development, Compose
+configures Silo and its browser-upload CORS policy automatically. The Compose
 backend uses `http://silo:9000`; a Cargo-hosted API uses
-`http://localhost:9000` from `.env.example`.
+`http://localhost:9000` from `.env.example`. The API periodically removes
+expired, failed, and abandoned uploads, including completed board images that
+were not attached to an image element within 24 hours.
 
 `POST /api/create-order` uses `PAYMENT_GATEWAY` (`razorpay` by default, or
 `paddle`). Razorpay keeps the existing order/verification flow. Paddle returns
