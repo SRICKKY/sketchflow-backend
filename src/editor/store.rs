@@ -671,7 +671,13 @@ pub async fn maybe_create_auto_version(db: &PgPool, board_id: &str, actor_id: &s
     }
     .await;
     if let Err(error) = result {
-        tracing::warn!(board_id, %error, "failed to create automatic board version");
+        tracing::warn!(
+            subsystem = "database",
+            event = "automatic_version_creation_failed",
+            board_id,
+            %error,
+            "Failed to create automatic board version"
+        );
     }
 }
 

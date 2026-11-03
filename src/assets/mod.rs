@@ -53,6 +53,11 @@ pub struct PresignedUpload {
     pub required_headers: std::collections::HashMap<String, String>,
 }
 
+pub struct UploadVerification {
+    pub valid: bool,
+    pub object_size_bytes: Option<i64>,
+}
+
 pub fn s3_upload_storage_path(
     config: &AppConfig,
     id: &str,
@@ -190,7 +195,7 @@ pub async fn verify_uploaded_object(
     storage_path: &str,
     mime_type: &str,
     expected_size: i64,
-) -> Result<bool, AppError> {
+) -> Result<UploadVerification, AppError> {
     let Some((bucket, key)) = parse_s3_storage_path(storage_path) else {
         return Err(AppError::Internal(anyhow::anyhow!(
             "direct upload has an invalid S3 storage path"
@@ -207,12 +212,19 @@ pub async fn verify_uploaded_object(
                 Some("NoSuchKey" | "NotFound" | "404")
             ) =>
         {
-            return Ok(false);
+            return Ok(UploadVerification {
+                valid: false,
+                object_size_bytes: None,
+            });
         }
         Err(error) => return Err(AppError::Internal(anyhow::anyhow!(error))),
     };
-    if head.content_length() != Some(expected_size) || head.content_type() != Some(mime_type) {
-        return Ok(false);
+    let object_size_bytes = head.content_length();
+    if object_size_bytes != Some(expected_size) || head.content_type() != Some(mime_type) {
+        return Ok(UploadVerification {
+            valid: false,
+            object_size_bytes,
+        });
     }
 
     let object = client
@@ -229,7 +241,10 @@ pub async fn verify_uploaded_object(
         .await
         .map_err(|error| AppError::Internal(anyhow::anyhow!(error)))?
         .into_bytes();
-    Ok(image_signature_matches(&prefix, mime_type))
+    Ok(UploadVerification {
+        valid: image_signature_matches(&prefix, mime_type),
+        object_size_bytes,
+    })
 }
 
 pub async fn cleanup_abandoned_uploads(db: &PgPool, config: &AppConfig) -> Result<u64, AppError> {
@@ -347,6 +362,7 @@ pub async fn save_asset(
     {
         let client = s3_client(config).await?;
         let image_key = s3_image_key(&id, mime_type);
+        let upload_started = std::time::Instant::now();
         let metadata = serde_json::to_vec(&AssetMetadata {
             id: &id,
             mime_type,
@@ -355,7 +371,7 @@ pub async fn save_asset(
         })
         .map_err(|err| AppError::Internal(anyhow::anyhow!(err)))?;
 
-        client
+        if let Err(error) = client
             .put_object()
             .bucket(bucket)
             .key(&image_key)
@@ -363,8 +379,28 @@ pub async fn save_asset(
             .body(ByteStream::from(buffer.to_vec()))
             .send()
             .await
-            .map_err(|err| AppError::Internal(anyhow::anyhow!(err)))?;
-        client
+        {
+            tracing::error!(
+                subsystem = "s3",
+                event = "asset_upload_failed",
+                asset_id = %id,
+                object_size_bytes = buffer.len() as u64,
+                duration_ms = upload_started.elapsed().as_millis() as u64,
+                error = %error,
+                "S3 asset upload failed"
+            );
+            return Err(AppError::Internal(anyhow::anyhow!(error)));
+        }
+        tracing::info!(
+            subsystem = "s3",
+            event = "asset_uploaded",
+            asset_id = %id,
+            mime_type,
+            object_size_bytes = buffer.len() as u64,
+            duration_ms = upload_started.elapsed().as_millis() as u64,
+            "S3 asset uploaded"
+        );
+        if let Err(error) = client
             .put_object()
             .bucket(bucket)
             .key(s3_metadata_key(&id))
@@ -372,7 +408,17 @@ pub async fn save_asset(
             .body(ByteStream::from(metadata))
             .send()
             .await
-            .map_err(|err| AppError::Internal(anyhow::anyhow!(err)))?;
+        {
+            tracing::error!(
+                subsystem = "s3",
+                event = "asset_metadata_upload_failed",
+                asset_id = %id,
+                duration_ms = upload_started.elapsed().as_millis() as u64,
+                error = %error,
+                "S3 asset metadata upload failed"
+            );
+            return Err(AppError::Internal(anyhow::anyhow!(error)));
+        }
 
         format!("s3://{bucket}/{image_key}")
     } else {

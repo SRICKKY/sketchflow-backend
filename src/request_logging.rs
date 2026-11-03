@@ -1,18 +1,48 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    env,
+    sync::{Arc, Mutex, OnceLock},
+    time::Instant,
+};
 
 // Tee request data as it streams through Axum; the logger never buffers the full body.
 use axum::{
     body::Body,
     extract::MatchedPath,
-    http::{header, Request},
+    http::{
+        header::{self, HeaderName, HeaderValue},
+        Request,
+    },
     middleware::Next,
     response::Response,
 };
 use http_body_util::BodyExt;
 use serde_json::Value;
+use tracing::Instrument;
 
 const MAX_LOGGED_JSON_BYTES: usize = 16 * 1024;
 const REDACTED: &str = "[REDACTED]";
+const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
+
+#[derive(Clone, Debug)]
+pub struct RequestId(pub String);
+
+static APP_ENVIRONMENT: OnceLock<String> = OnceLock::new();
+
+pub fn app_environment() -> &'static str {
+    APP_ENVIRONMENT
+        .get_or_init(|| {
+            env::var("APP_ENV")
+                .ok()
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "development".to_owned())
+        })
+        .as_str()
+}
+
+pub fn generate_request_id() -> String {
+    format!("req_{}", cuid2::create_id())
+}
 
 #[derive(Default)]
 struct BodyCapture {
@@ -36,13 +66,21 @@ impl BodyCapture {
 }
 
 pub async fn log_request_payload(request: Request<Body>, next: Next) -> Response {
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
     let method = parts.method.clone();
     let path = parts
         .extensions
         .get::<MatchedPath>()
         .map(|matched| matched.as_str().to_owned())
         .unwrap_or_else(|| parts.uri.path().to_owned());
+    let request_id = parts
+        .headers
+        .get(&REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| is_valid_request_id(value))
+        .map(str::to_owned)
+        .unwrap_or_else(generate_request_id);
+    parts.extensions.insert(RequestId(request_id.clone()));
     let content_type = parts
         .headers
         .get(header::CONTENT_TYPE)
@@ -67,24 +105,55 @@ pub async fn log_request_payload(request: Request<Body>, next: Next) -> Response
         frame
     });
 
-    let response = next
-        .run(Request::from_parts(parts, Body::new(tracked_body)))
-        .await;
-    let capture = capture
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let payload = format_payload(&capture, is_json, content_length, content_type.as_deref());
-
-    tracing::info!(
+    let span = tracing::info_span!(
+        "http_request",
+        service = "sketchflow-api",
+        environment = app_environment(),
+        request_id = %request_id,
         method = %method,
-        path = %path,
-        status = response.status().as_u16(),
-        body_bytes_observed = capture.observed_bytes,
-        request_payload = %payload,
-        "API request completed"
+        endpoint = %path,
     );
+    async move {
+        let started = Instant::now();
+        let mut response = next
+            .run(Request::from_parts(parts, Body::new(tracked_body)))
+            .await;
+        let capture = capture
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let payload = format_payload(&capture, is_json, content_length, content_type.as_deref());
 
-    response
+        tracing::info!(
+            service = "sketchflow-api",
+            environment = app_environment(),
+            request_id = %request_id,
+            subsystem = "http",
+            event = "request_completed",
+            method = %method,
+            endpoint = %path,
+            status = response.status().as_u16(),
+            duration_ms = started.elapsed().as_millis() as u64,
+            body_bytes_observed = capture.observed_bytes,
+            request_payload = %payload,
+            "HTTP request completed"
+        );
+
+        response.headers_mut().insert(
+            &REQUEST_ID_HEADER,
+            HeaderValue::from_str(&request_id).expect("validated request IDs are valid headers"),
+        );
+        response
+    }
+    .instrument(span)
+    .await
+}
+
+fn is_valid_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn is_json_content_type(content_type: &str) -> bool {
@@ -128,7 +197,12 @@ fn format_payload(
             match serde_json::to_string(&value) {
                 Ok(payload) => payload,
                 Err(error) => {
-                    tracing::warn!(%error, "failed to serialize redacted API request payload");
+                    tracing::warn!(
+                        subsystem = "http",
+                        event = "request_payload_serialization_failed",
+                        %error,
+                        "Failed to serialize redacted API request payload"
+                    );
                     "<JSON serialization failed>".to_owned()
                 }
             }
@@ -280,6 +354,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/test")
                     .header("content-type", "application/json")
+                    .header("x-request-id", "req_test123")
                     .body(Body::from(body))
                     .unwrap(),
             )
@@ -287,9 +362,40 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            response.headers().get("x-request-id").unwrap(),
+            "req_test123"
+        );
         assert!(to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn middleware_replaces_invalid_request_ids() {
+        let app = Router::new()
+            .route("/api/test", post(|| async { StatusCode::NO_CONTENT }))
+            .layer(middleware::from_fn(log_request_payload));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/test")
+                    .header("x-request-id", "not a valid id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(request_id.starts_with("req_"));
+        assert!(super::is_valid_request_id(request_id));
     }
 }

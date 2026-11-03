@@ -37,33 +37,59 @@ const MAX_MULTIPART_BODY_BYTES: usize = profile::avatar::AVATAR_MAX_BYTES as usi
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().ok();
+    init_tracing();
+
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("install Rustls ring crypto provider");
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "sketchflow_backend=debug,tower_http=info".into()),
-        )
-        .init();
 
     let config = AppConfig::from_env();
     let addr = config.socket_addr();
 
     let pool = db::connect(&config.database_url)
         .await
-        .expect("failed to connect to database");
+        .unwrap_or_else(|error| {
+            tracing::error!(
+                service = "sketchflow-api",
+                environment = request_logging::app_environment(),
+                subsystem = "database",
+                event = "connection_failed",
+                error = %error,
+                "Database connection failed"
+            );
+            panic!("failed to connect to database");
+        });
 
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await
-        .expect("failed to run database migrations");
+        .unwrap_or_else(|error| {
+            tracing::error!(
+                service = "sketchflow-api",
+                environment = request_logging::app_environment(),
+                subsystem = "database",
+                event = "migration_failed",
+                error = %error,
+                "Database migration failed"
+            );
+            panic!("failed to run database migrations");
+        });
 
     let collaboration = match config.redis_url.as_deref() {
         Some(redis_url) => routes::collaboration::CollaborationHub::with_redis(redis_url)
             .await
-            .unwrap_or_else(|_| panic!("failed to initialize Redis collaboration pub/sub")),
+            .unwrap_or_else(|error| {
+                tracing::error!(
+                    service = "sketchflow-api",
+                    environment = request_logging::app_environment(),
+                    subsystem = "websocket",
+                    event = "redis_initialization_failed",
+                    error = %error,
+                    "Failed to initialize collaboration Redis"
+                );
+                panic!("failed to initialize Redis collaboration pub/sub");
+            }),
         None => routes::collaboration::CollaborationHub::default(),
     };
 
@@ -81,10 +107,24 @@ async fn main() {
             interval.tick().await;
             match assets::cleanup_abandoned_uploads(&cleanup_db, &cleanup_config).await {
                 Ok(cleaned) if cleaned > 0 => {
-                    tracing::info!(cleaned, "cleaned abandoned image uploads");
+                    tracing::info!(
+                        service = "sketchflow-api",
+                        environment = request_logging::app_environment(),
+                        subsystem = "uploads",
+                        event = "abandoned_uploads_cleaned",
+                        count = cleaned,
+                        "Cleaned abandoned image uploads"
+                    );
                 }
                 Ok(_) => {}
-                Err(error) => tracing::warn!(%error, "failed to clean abandoned image uploads"),
+                Err(error) => tracing::warn!(
+                    service = "sketchflow-api",
+                    environment = request_logging::app_environment(),
+                    subsystem = "uploads",
+                    event = "abandoned_upload_cleanup_failed",
+                    error = %error,
+                    "Failed to clean abandoned image uploads"
+                ),
             }
         }
     });
@@ -101,7 +141,9 @@ async fn main() {
             axum::http::header::CONTENT_TYPE,
             axum::http::header::AUTHORIZATION,
             axum::http::header::COOKIE,
+            axum::http::header::HeaderName::from_static("x-request-id"),
         ])
+        .expose_headers([axum::http::header::HeaderName::from_static("x-request-id")])
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,
@@ -195,8 +237,48 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| panic!("failed to bind to {addr}: {e}"));
-    tracing::info!("listening on {}", listener.local_addr().unwrap());
+    tracing::info!(
+        service = "sketchflow-api",
+        environment = request_logging::app_environment(),
+        subsystem = "startup",
+        event = "service_started",
+        address = %listener.local_addr().unwrap(),
+        "API server listening"
+    );
     axum::serve(listener, app).await.expect("server error");
+}
+
+fn init_tracing() {
+    use tracing_subscriber::{fmt::time::UtcTime, EnvFilter};
+
+    let production = request_logging::app_environment() == "production";
+    let filter = || {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            if production {
+                "sketchflow_backend=info,tower_http=info".into()
+            } else {
+                "sketchflow_backend=debug,tower_http=info".into()
+            }
+        })
+    };
+
+    if production {
+        tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_current_span(true)
+            .with_span_list(true)
+            .with_ansi(false)
+            .with_timer(UtcTime::rfc_3339())
+            .with_env_filter(filter())
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .pretty()
+            .with_timer(UtcTime::rfc_3339())
+            .with_env_filter(filter())
+            .init();
+    }
 }
 
 #[cfg(test)]

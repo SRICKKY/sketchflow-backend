@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tower_cookies::Cookies;
 
 use crate::{
@@ -180,6 +180,7 @@ pub async fn presign_upload(
     .execute(&state.db)
     .await?;
 
+    let presign_started = Instant::now();
     let presigned = match assets::presign_upload(
         &state.config,
         &asset_id,
@@ -190,6 +191,14 @@ pub async fn presign_upload(
     {
         Ok(presigned) => presigned,
         Err(error) => {
+            tracing::error!(
+                subsystem = "s3",
+                event = "upload_presign_failed",
+                asset_id = %asset_id,
+                object_size_bytes = request.byte_size,
+                duration_ms = presign_started.elapsed().as_millis() as u64,
+                "Failed to create image upload URL"
+            );
             sqlx::query(
                 "UPDATE assets SET status = 'failed', expires_at = now(), cleanup_at = now() WHERE id = $1",
             )
@@ -199,6 +208,15 @@ pub async fn presign_upload(
             return Err(error);
         }
     };
+    tracing::info!(
+        subsystem = "s3",
+        event = "upload_presigned",
+        asset_id = %asset_id,
+        mime_type = %request.mime_type,
+        object_size_bytes = request.byte_size,
+        duration_ms = presign_started.elapsed().as_millis() as u64,
+        "Created image upload URL"
+    );
 
     Ok(Json(PresignUploadResponse {
         asset_id,
@@ -227,11 +245,19 @@ pub async fn complete_upload(
     cookies: Cookies,
     Path(asset_id): Path<String>,
 ) -> AppResult<Json<UploadResponse>> {
+    let request_started = Instant::now();
     let user = session::require_current_user(&cookies, &state).await?;
     let row = load_upload(&state, &asset_id).await?;
     authorize_upload(&state, &user.id, &row).await?;
 
     if row.status == "complete" {
+        log_upload_completed(
+            &asset_id,
+            &user.id,
+            i64::from(row.byte_size),
+            request_started,
+            true,
+        );
         return Ok(Json(upload_response(&asset_id, &row)));
     }
     if row.status != "pending" {
@@ -249,14 +275,39 @@ pub async fn complete_upload(
         ));
     }
 
-    let valid = assets::verify_uploaded_object(
+    let verification_started = Instant::now();
+    let verification = match assets::verify_uploaded_object(
         &state.config,
         &row.storage_path,
         &row.mime_type,
         i64::from(row.byte_size),
     )
-    .await?;
-    if !valid {
+    .await
+    {
+        Ok(verification) => verification,
+        Err(error) => {
+            tracing::error!(
+                subsystem = "s3",
+                event = "upload_verification_failed",
+                asset_id = %asset_id,
+                expected_object_size_bytes = row.byte_size,
+                duration_ms = verification_started.elapsed().as_millis() as u64,
+                "Failed to verify uploaded image"
+            );
+            return Err(error);
+        }
+    };
+    if !verification.valid {
+        tracing::warn!(
+            subsystem = "s3",
+            event = "upload_verification_failed",
+            asset_id = %asset_id,
+            expected_object_size_bytes = row.byte_size,
+            object_size_bytes = ?verification.object_size_bytes,
+            duration_ms = verification_started.elapsed().as_millis() as u64,
+            reason = "object_metadata_or_signature_mismatch",
+            "Uploaded image verification failed"
+        );
         sqlx::query("UPDATE assets SET status = 'failed' WHERE id = $1 AND status = 'pending'")
             .bind(&asset_id)
             .execute(&state.db)
@@ -281,6 +332,13 @@ pub async fn complete_upload(
     if updated == 0 {
         let latest = load_upload(&state, &asset_id).await?;
         if latest.status == "complete" {
+            log_upload_completed(
+                &asset_id,
+                &user.id,
+                i64::from(latest.byte_size),
+                request_started,
+                true,
+            );
             return Ok(Json(upload_response(&asset_id, &latest)));
         }
         return Err(AppError::Conflict(
@@ -288,7 +346,46 @@ pub async fn complete_upload(
         ));
     }
 
+    let object_size_bytes = verification.object_size_bytes.ok_or_else(|| {
+        AppError::Internal(anyhow::anyhow!(
+            "verified S3 upload had no reported object size"
+        ))
+    })?;
+    tracing::info!(
+        subsystem = "s3",
+        event = "upload_object_verified",
+        asset_id = %asset_id,
+        object_size_bytes,
+        duration_ms = verification_started.elapsed().as_millis() as u64,
+        "Uploaded image object verified"
+    );
+    log_upload_completed(
+        &asset_id,
+        &user.id,
+        object_size_bytes,
+        request_started,
+        false,
+    );
     Ok(Json(upload_response(&asset_id, &row)))
+}
+
+fn log_upload_completed(
+    asset_id: &str,
+    user_id: &str,
+    byte_size: i64,
+    started: Instant,
+    idempotent: bool,
+) {
+    tracing::info!(
+        subsystem = "s3",
+        event = "upload_completed",
+        asset_id,
+        user_id,
+        object_size_bytes = byte_size,
+        duration_ms = started.elapsed().as_millis() as u64,
+        idempotent,
+        "Image upload completed"
+    );
 }
 
 #[utoipa::path(
@@ -317,6 +414,14 @@ pub async fn abort_upload(
             .bind(&asset_id)
             .execute(&state.db)
             .await?;
+        tracing::info!(
+            subsystem = "uploads",
+            event = "upload_aborted",
+            asset_id = %asset_id,
+            user_id = %user.id,
+            object_size_bytes = row.byte_size,
+            "Image upload aborted"
+        );
     }
 
     Ok(StatusCode::NO_CONTENT)

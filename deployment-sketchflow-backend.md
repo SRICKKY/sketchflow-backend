@@ -119,6 +119,7 @@ EC2/systemd provisioning steps are in
 
 - Add an A record for `backend.sketchflow.online` pointing to the EC2 Elastic IP.
 - Configure the API runtime with production values, including:
+  - `APP_ENV=production` to enable structured JSON logs.
   - `HOST=127.0.0.1` and `PORT=8080` behind Nginx.
   - `PUBLIC_BASE_URL=https://backend.sketchflow.online`; OAuth callbacks are
     `https://backend.sketchflow.online/api/auth/google/callback` and
