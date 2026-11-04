@@ -7,6 +7,7 @@ use serde_json::{Map, Value};
 use crate::error::AppError;
 
 pub const EMBED_URL_MAX: usize = 2048;
+pub const CODE_BLOCK_MAX_LENGTH: usize = 50_000;
 
 const FILL_STYLES: &[&str] = &["solid", "hachure", "cross-hatch", "none"];
 const STROKE_STYLES: &[&str] = &["solid", "dashed", "dotted"];
@@ -20,6 +21,16 @@ const FONT_WEIGHTS: &[&str] = &["normal", "bold"];
 const FONT_STYLES: &[&str] = &["normal", "italic"];
 const TEXT_ALIGN: &[&str] = &["left", "center", "right"];
 const VERTICAL_ALIGN: &[&str] = &["top", "middle", "bottom"];
+const CODE_LANGUAGES: &[&str] = &[
+    "plaintext",
+    "javascript",
+    "typescript",
+    "python",
+    "json",
+    "html",
+    "css",
+    "rust",
+];
 
 type Check<T> = Result<T, String>;
 
@@ -305,6 +316,10 @@ pub fn element(value: &Value, path: &str) -> Check<Value> {
         }
         "frame" => obj.string("name", true, 1, Some(80))?,
         "embed" => obj.string("url", true, 0, Some(EMBED_URL_MAX))?,
+        "code" => {
+            obj.string("code", true, 0, Some(CODE_BLOCK_MAX_LENGTH))?;
+            obj.one_of("language", true, CODE_LANGUAGES)?;
+        }
         _ => {
             return Err(format!(
                 "{path}.type is not a supported canvas element type"
@@ -512,6 +527,7 @@ mod tests {
             with("note", note),
             with("frame", json!({"name":"Frame 1"})),
             with("embed", json!({"url":"https://example.com"})),
+            with("code", json!({"code":"print('hello')","language":"python"})),
         ];
         for sample in samples {
             let parsed = element(&sample, "el").unwrap_or_else(|e| panic!("{e}"));
@@ -561,6 +577,11 @@ mod tests {
             }),
             with("frame", json!({"name": "x".repeat(81)})),
             with("embed", json!({"url": "x".repeat(EMBED_URL_MAX + 1)})),
+            with(
+                "code",
+                json!({"code":"x".repeat(CODE_BLOCK_MAX_LENGTH + 1),"language":"python"}),
+            ),
+            with("code", json!({"code":"print(1)","language":"brainfuck"})),
             base("script"),
             json!("not an object"),
         ];
