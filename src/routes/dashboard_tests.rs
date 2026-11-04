@@ -445,6 +445,10 @@ async fn dashboard_http_flows_and_authorization() {
     )
     .await;
     assert_eq!(shared["items"].as_array().unwrap().len(), 1);
+    let favorites_before = request(&app, Some(&guest), "GET", "/api/dashboard", None, 200).await
+        ["counts"]["favorites"]
+        .as_i64()
+        .unwrap();
     request(
         &app,
         Some(&guest),
@@ -465,6 +469,11 @@ async fn dashboard_http_flows_and_authorization() {
     .await;
     assert_eq!(favorites["items"].as_array().unwrap().len(), 1);
     assert_eq!(favorites["items"][0]["isFavorite"], true);
+    let favorites_after = request(&app, Some(&guest), "GET", "/api/dashboard", None, 200).await
+        ["counts"]["favorites"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(favorites_after, favorites_before + 1);
     request(
         &app,
         Some(&guest),
@@ -474,6 +483,11 @@ async fn dashboard_http_flows_and_authorization() {
         200,
     )
     .await;
+    let favorites_after_removal = request(&app, Some(&guest), "GET", "/api/dashboard", None, 200)
+        .await["counts"]["favorites"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(favorites_after_removal, favorites_before);
     request(&app, Some(&free), "GET", "/api/collections", None, 403).await;
     request(&app, Some(&expired), "GET", "/api/collections", None, 403).await;
     let collection = request(
@@ -1057,6 +1071,10 @@ async fn dashboard_http_flows_and_authorization() {
         409,
     )
     .await;
+    let trash_before = request(&app, Some(&free), "GET", "/api/dashboard", None, 200).await
+        ["counts"]["trash"]
+        .as_i64()
+        .unwrap();
     request(&app, Some(&free), "DELETE", &path, None, 200).await;
     request(
         &app,
@@ -1088,6 +1106,11 @@ async fn dashboard_http_flows_and_authorization() {
     .await;
     assert_eq!(trash["items"].as_array().unwrap().len(), 1);
     assert_eq!(trash["items"][0]["id"], board_id);
+    let trash_after = request(&app, Some(&free), "GET", "/api/dashboard", None, 200).await
+        ["counts"]["trash"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(trash_after, trash_before + 1);
     request(
         &app,
         Some(&admin_token),
@@ -1106,6 +1129,11 @@ async fn dashboard_http_flows_and_authorization() {
         200,
     )
     .await;
+    let trash_after_restore = request(&app, Some(&free), "GET", "/api/dashboard", None, 200).await
+        ["counts"]["trash"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(trash_after_restore, trash_before);
     request(
         &app,
         Some(&free),

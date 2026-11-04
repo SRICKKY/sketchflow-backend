@@ -121,6 +121,13 @@ struct Capabilities {
     can_save_templates: bool,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardCounts {
+    favorites: i64,
+    trash: i64,
+}
+
 #[derive(Debug, Serialize, FromRow)]
 #[serde(rename_all = "camelCase")]
 struct PrivateCollectionSummary {
@@ -133,6 +140,7 @@ struct PrivateCollectionSummary {
 struct DashboardResponse {
     capabilities: Capabilities,
     workspaces: Vec<WorkspaceSummary>,
+    counts: DashboardCounts,
 }
 
 #[derive(Serialize)]
@@ -429,6 +437,21 @@ async fn dashboard(
     .bind(&user.id)
     .fetch_one(&state.db)
     .await?;
+    let (favorites, trash): (i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT count(DISTINCT b.id)
+             FROM board_favorites favorite
+             JOIN boards b ON b.id=favorite.board_id
+             LEFT JOIN board_members m ON m.board_id=b.id AND m.user_id=$1
+             LEFT JOIN workspace_members wm ON wm.workspace_id=b.workspace_id AND wm.user_id=$1
+             WHERE favorite.user_id=$1 AND b.deleted_at IS NULL
+               AND (b.owner_id=$1 OR m.id IS NOT NULL OR ($2::boolean AND wm.user_id=$1))),
+            (SELECT count(*) FROM boards b WHERE b.owner_id=$1 AND b.deleted_at IS NOT NULL)",
+    )
+    .bind(&user.id)
+    .bind(pro)
+    .fetch_one(&state.db)
+    .await?;
     Ok(Json(DashboardResponse {
         capabilities: Capabilities {
             is_pro: pro,
@@ -442,6 +465,7 @@ async fn dashboard(
             can_save_templates: pro,
         },
         workspaces: workspace_list(&state.db, &user.id).await?,
+        counts: DashboardCounts { favorites, trash },
     }))
 }
 
