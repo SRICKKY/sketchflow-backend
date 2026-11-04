@@ -158,6 +158,7 @@ async fn dashboard_http_flows_and_authorization() {
     };
     let app = router()
         .merge(super::super::editor::router())
+        .merge(super::super::public_links::router())
         .route(
             "/api/boards/{board_id}/snapshot",
             get(super::super::collaboration::snapshot),
@@ -1163,6 +1164,115 @@ async fn dashboard_http_flows_and_authorization() {
     );
     let caps = request(&app, Some(&free), "GET", "/api/dashboard", None, 200).await;
     assert_eq!(caps["capabilities"]["canCreateBoard"], true);
+
+    sqlx::query(
+        "INSERT INTO boards(id,name,owner_id) VALUES
+         ('public-board','Public board','pro'),
+         ('public-free-board','Free board','free')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO board_members(id,board_id,user_id,role)
+         VALUES('public-editor','public-board','guest','EDITOR')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO board_elements(id,board_id,element_id,type,data)
+         VALUES('public-element-row','public-board','public-element','rectangle',
+                '{\"id\":\"public-element\",\"type\":\"rectangle\"}'::jsonb)",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO board_comments(id,board_id,author_id,body,x,y)
+         VALUES('public-comment','public-board','guest','Read-only note',4,8)",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO comment_reactions(id,comment_id,user_id,emoji) VALUES
+         ('public-reaction-1','public-comment','guest','👍'),
+         ('public-reaction-2','public-comment','pro','👍')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    request(
+        &app,
+        None,
+        "GET",
+        "/api/boards/public-board/public-link",
+        None,
+        401,
+    )
+    .await;
+    request(
+        &app,
+        Some(&guest),
+        "PUT",
+        "/api/boards/public-board/public-link",
+        None,
+        403,
+    )
+    .await;
+    request(
+        &app,
+        Some(&free),
+        "PUT",
+        "/api/boards/public-free-board/public-link",
+        None,
+        403,
+    )
+    .await;
+    let disabled = request(
+        &app,
+        Some(&pro),
+        "GET",
+        "/api/boards/public-board/public-link",
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(disabled["enabled"], false);
+    let enabled = request(
+        &app,
+        Some(&pro),
+        "PUT",
+        "/api/boards/public-board/public-link",
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(enabled["enabled"], true);
+    let public_token = enabled["token"].as_str().unwrap();
+    assert_eq!(public_token.len(), 43);
+    let public_path = format!("/api/public/boards/public-board/{public_token}");
+    let public_board = request(&app, None, "GET", &public_path, None, 200).await;
+    assert_eq!(public_board["name"], "Public board");
+    assert_eq!(public_board["elements"][0]["id"], "public-element");
+    assert!(public_board.get("presentation").is_none());
+    let public_comment = &public_board["comments"][0];
+    assert_eq!(public_comment["body"], "Read-only note");
+    assert_eq!(public_comment["authorName"], "guest");
+    assert_eq!(public_comment["reactions"][0]["count"], 2);
+    assert!(public_comment.get("authorId").is_none());
+    request(
+        &app,
+        Some(&pro),
+        "DELETE",
+        "/api/boards/public-board/public-link",
+        None,
+        200,
+    )
+    .await;
+    request(&app, None, "GET", &public_path, None, 404).await;
+
     db.close().await;
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
         .execute(&admin)

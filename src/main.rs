@@ -228,6 +228,7 @@ async fn main() {
         .merge(routes::dashboard::router())
         .merge(routes::editor::router())
         .merge(routes::notifications::router())
+        .merge(routes::public_links::router())
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .layer(CookieManagerLayer::new())
