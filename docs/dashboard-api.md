@@ -68,12 +68,17 @@ interface TemplateSummary {
     "canCreateBoard": true,
     "canSaveTemplates": false
   },
-  "workspaces": []
+  "workspaces": [],
+  "counts": {
+    "favorites": 0,
+    "trash": 0
+  }
 }
 ```
 
 `workspaces` contains `WorkspaceSummary` rows. `maxOwnedBoards` is `null` for
-Pro (unlimited). Free/expired users receive an empty workspace list.
+Pro (unlimited). Free/expired users receive an empty workspace list. `counts`
+contains the caller's accessible active favorites and owned boards in Trash.
 
 Active Pro is resolved by the existing billing service: a live subscription
 or `plan=pro` with a future `plan_expires_at`; a bare Pro label is insufficient.
