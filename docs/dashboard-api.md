@@ -5,9 +5,10 @@ Prisma database. Startup runs migrations, including `0003_dashboard.sql` for
 saved templates, and `0004_board_list_pagination.sql` for page indexes.
 Do not point a test run at Neon or a production database.
 
-All endpoints require the `sketchflow_session` cookie. JSON requests use
-`Content-Type: application/json`; browser requests must include credentials.
-Configure the frontend origin in `CORS_ALLOWED_ORIGINS`. CORS allows PATCH.
+Dashboard endpoints require the `sketchflow_session` cookie. Public-link read
+endpoints are the exception. JSON requests use `Content-Type: application/json`;
+browser requests must include credentials for authenticated calls. Configure
+the frontend origin in `CORS_ALLOWED_ORIGINS`. CORS allows PATCH.
 DTO property names are camelCase, role values are uppercase, and dates are UTC
 RFC 3339 strings. Unless specified otherwise, successful requests return 200.
 
@@ -189,6 +190,28 @@ board ownership continues to resolve independently of workspace fallback.
 Workspace fallback requires active Pro; OWNER/ADMIN resolve as editor and
 MEMBER as viewer. Workspace membership grants no ability to delete someone
 else's board or manage its direct membership.
+
+### Public board links
+
+| Method / endpoint | Request | Response / permission |
+| --- | --- | --- |
+| `GET /api/boards/{id}/public-link` | — | `{enabled:boolean, token:string \| null}`; board owner |
+| `PUT /api/boards/{id}/public-link` | — | `{enabled:true, token:string}`; active Pro board owner |
+| `DELETE /api/boards/{id}/public-link` | — | `{enabled:false, token:null}`; board owner |
+| `GET /api/public/boards/{id}/{token}` | — | `{id, name, elements, comments}`; no session required |
+| `GET /api/public/boards/{id}/{token}/assets/{assetId}` | — | Board-referenced image asset; no session required |
+
+Enabling creates a link for the board owner. The opaque token is derived from
+a server secret and a random database nonce; the raw bearer token is not
+stored. Only an active Pro owner can enable a new link. Once enabled, it stays
+active until the owner revokes it, including after a Pro downgrade. Owners can
+inspect or revoke existing links without an active Pro subscription.
+
+The public response includes canvas elements, comment text, commenter display
+names, and reaction totals. It omits commenter IDs/emails, presentation data,
+and mutation permissions. Public viewers have no comment/reaction or
+presentation endpoints. Public image access is limited to assets currently
+referenced by that board. Public responses and assets are not cacheable.
 
 ## Templates
 

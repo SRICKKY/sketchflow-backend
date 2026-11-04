@@ -7,4 +7,5 @@ pub mod health;
 pub mod invoices;
 pub mod notifications;
 pub mod profile;
+pub mod public_links;
 pub mod uploads;
