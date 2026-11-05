@@ -57,10 +57,13 @@ and authentication integration plan.
 
 Compose reads optional `JWT_SECRET`, `JWT_SESSION_DAYS`, `FRONTEND_BASE_URL`,
 `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GITHUB_CLIENT_ID`,
-`GITHUB_CLIENT_SECRET`, `CORS_ALLOWED_ORIGINS`, `BACKEND_PORT`, `S3_BUCKET`,
-`S3_REGION`, `S3_PUBLIC_ENDPOINT_URL`, `S3_ACCESS_KEY_ID`,
-`S3_SECRET_ACCESS_KEY`, and `RUST_LOG` values from your shell or backend `.env`.
-It deliberately ignores `DATABASE_URL` and
+`GITHUB_CLIENT_SECRET`, `CORS_ALLOWED_ORIGINS`, `BACKEND_PORT`,
+`PAYMENT_GATEWAY`, `PADDLE_ENV`, `PADDLE_API_KEY`, `PADDLE_CLIENT_TOKEN`,
+`PADDLE_WEBHOOK_SECRET`, `PADDLE_PRICE_ID_MONTHLY`, `PADDLE_PRICE_ID_YEARLY`,
+`PADDLE_PRICE_ID_LIFETIME`, `S3_BUCKET`, `S3_REGION`,
+`S3_PUBLIC_ENDPOINT_URL`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, and
+`RUST_LOG` values from your shell or backend `.env`. It deliberately ignores
+`DATABASE_URL` and
 `REDIS_URL` there and uses the local services instead. The Compose backend
 connects to Silo at `http://silo:9000`. The development database password,
 Silo credentials, and default JWT secret are **local-only defaults**, not
@@ -145,6 +148,9 @@ The server listens on `http://localhost:8080` by default.
 - Health check: `GET /health`
 - Swagger UI: `GET /docs`
 - OpenAPI JSON: `GET /api-docs/openapi.json`
+
+For end-to-end local payment testing, see
+[Test Paddle Sandbox Locally](docs/paddle-sandbox-local-testing.md).
 
 ## Endpoints
 

@@ -16,10 +16,11 @@ use printpdf::{
     PdfSaveOptions, Point, Pt, Rgb,
 };
 
-use super::{BillingInterval, InvoiceRecord};
+use super::InvoiceRecord;
 
 const PRO_MONTHLY_USD: i64 = 5;
 const PRO_YEARLY_USD: i64 = 50;
+const LIFETIME_PRO_USD: i64 = 300;
 
 const PAGE_WIDTH_PT: f32 = 612.0;
 const PAGE_HEIGHT_PT: f32 = 792.0;
@@ -68,19 +69,21 @@ pub fn pdf_amount_label(amount_minor: i32, currency: &str) -> String {
 }
 
 /// Mirrors `planLabel` from `lib/billing/invoice.ts`.
-fn plan_label(interval: BillingInterval) -> &'static str {
+fn plan_label(interval: &str) -> &'static str {
     match interval {
-        BillingInterval::Year => "SketchFlow Pro (annual)",
-        BillingInterval::Month => "SketchFlow Pro (monthly)",
+        "lifetime" => "SketchFlow Lifetime Pro",
+        "year" => "SketchFlow Pro (annual)",
+        _ => "SketchFlow Pro (monthly)",
     }
 }
 
 /// Mirrors `planUsdLabel` from `lib/billing/invoice.ts` (`formatUsd` with the
 /// default of zero fraction digits, e.g. `$5`).
-fn plan_usd_label(interval: BillingInterval) -> String {
+fn plan_usd_label(interval: &str) -> String {
     match interval {
-        BillingInterval::Year => format!("${} USD / year", PRO_YEARLY_USD),
-        BillingInterval::Month => format!("${} USD / month", PRO_MONTHLY_USD),
+        "lifetime" => format!("${} USD, one time", LIFETIME_PRO_USD),
+        "year" => format!("${} USD / year", PRO_YEARLY_USD),
+        _ => format!("${} USD / month", PRO_MONTHLY_USD),
     }
 }
 
@@ -169,7 +172,7 @@ pub fn build_invoice_pdf(
     billed_to_name: &str,
     billed_to_email: Option<&str>,
 ) -> Vec<u8> {
-    let interval = BillingInterval::parse(&invoice.interval);
+    let interval = invoice.interval.as_str();
     let mut ops: Vec<Op> = Vec::new();
 
     ops.extend(text_op(

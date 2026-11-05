@@ -33,8 +33,10 @@ pub struct AppConfig {
     pub paddle_webhook_secret: Option<String>,
     pub paddle_price_id_monthly: Option<String>,
     pub paddle_price_id_yearly: Option<String>,
+    pub paddle_price_id_lifetime: Option<String>,
     pub plan_price_month_minor: i64,
     pub plan_price_year_minor: i64,
+    pub plan_price_lifetime_minor: i64,
     pub checkout_currency: String,
     pub public_base_url: String,
 }
@@ -115,12 +117,18 @@ impl AppConfig {
             paddle_price_id_yearly: env::var("PADDLE_PRICE_ID_YEARLY")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            paddle_price_id_lifetime: env::var("PADDLE_PRICE_ID_LIFETIME")
+                .ok()
+                .filter(|s| !s.is_empty()),
             plan_price_month_minor: env_var("PLAN_PRICE_MONTH_MINOR", "50000")
                 .parse()
                 .unwrap_or(50000),
             plan_price_year_minor: env_var("PLAN_PRICE_YEAR_MINOR", "500000")
                 .parse()
                 .unwrap_or(500000),
+            plan_price_lifetime_minor: env_var("PLAN_PRICE_LIFETIME_MINOR", "3000000")
+                .parse()
+                .unwrap_or(3000000),
             checkout_currency: env_var("CHECKOUT_CURRENCY", "INR"),
             public_base_url: env_var("PUBLIC_BASE_URL", "http://localhost:8080"),
         }

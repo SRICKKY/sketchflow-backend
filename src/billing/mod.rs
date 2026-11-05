@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{DateTime, Datelike, TimeZone, Utc};
 use sqlx::PgPool;
 
 use crate::{config::AppConfig, error::AppError};
@@ -142,21 +142,42 @@ pub struct BillingState {
     pub status: BillingStatus,
     pub plan: &'static str,
     pub interval: Option<BillingInterval>,
+    pub lifetime_pro: bool,
+    pub paid_amount_minor: Option<i64>,
     pub starts_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(sqlx::FromRow)]
 struct ActiveSubscriptionRow {
+    id: String,
     interval: String,
     starts_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
 }
 
 #[derive(sqlx::FromRow)]
+struct PaidInvoiceRow {
+    amount_minor: i32,
+    currency: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct UserPlanRow {
     plan: String,
     plan_expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ActiveLifetimePurchaseRow {
+    starts_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+}
+
+pub fn lifetime_expiry() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0)
+        .single()
+        .expect("2100-01-01 is a valid UTC timestamp")
 }
 
 /// Looks up the user's current billing state, expiring overdue subscription
@@ -166,7 +187,7 @@ pub async fn get_billing_state(db: &PgPool, user_id: &str) -> Result<BillingStat
     let now = Utc::now();
 
     let latest = sqlx::query_as::<_, ActiveSubscriptionRow>(
-        r#"SELECT interval, starts_at, expires_at
+        r#"SELECT id, interval, starts_at, expires_at
            FROM subscriptions
            WHERE user_id = $1 AND status = 'active'
            ORDER BY expires_at DESC
@@ -176,6 +197,29 @@ pub async fn get_billing_state(db: &PgPool, user_id: &str) -> Result<BillingStat
     .fetch_optional(db)
     .await?;
 
+    let paid_amount_minor = if let Some(subscription) = &latest {
+        let invoice = sqlx::query_as::<_, PaidInvoiceRow>(
+            r#"SELECT amount_minor, currency
+           FROM invoices
+           WHERE subscription_id = $1 AND status = 'paid'
+           ORDER BY paid_at DESC
+           LIMIT 1"#,
+        )
+        .bind(&subscription.id)
+        .fetch_optional(db)
+        .await?;
+        invoice.and_then(|invoice| {
+            let amount = i64::from(invoice.amount_minor);
+            match invoice.currency.trim().to_uppercase().as_str() {
+                "INR" if amount > 0 => Some(amount),
+                "USD" if amount > 0 => amount.checked_mul(100),
+                _ => None,
+            }
+        })
+    } else {
+        None
+    };
+
     let user = sqlx::query_as::<_, UserPlanRow>(
         r#"SELECT plan, plan_expires_at FROM users WHERE id = $1"#,
     )
@@ -183,6 +227,61 @@ pub async fn get_billing_state(db: &PgPool, user_id: &str) -> Result<BillingStat
     .fetch_optional(db)
     .await?
     .ok_or_else(|| AppError::Unauthorized("Sign in to continue.".to_string()))?;
+
+    sqlx::query(
+        r#"UPDATE lifetime_purchases SET status = 'expired', updated_at = now()
+           WHERE user_id = $1 AND status = 'active' AND expires_at <= $2"#,
+    )
+    .bind(user_id)
+    .bind(now)
+    .execute(db)
+    .await?;
+
+    let lifetime = sqlx::query_as::<_, ActiveLifetimePurchaseRow>(
+        r#"SELECT starts_at, expires_at
+           FROM lifetime_purchases
+           WHERE user_id = $1 AND status = 'active' AND expires_at > $2
+           ORDER BY expires_at DESC
+           LIMIT 1"#,
+    )
+    .bind(user_id)
+    .bind(now)
+    .fetch_optional(db)
+    .await?;
+
+    if let Some(lifetime) = lifetime {
+        if latest.as_ref().is_some_and(|s| s.expires_at <= now) {
+            sqlx::query(
+                r#"UPDATE subscriptions SET status = 'expired', updated_at = now()
+                   WHERE user_id = $1 AND status = 'active' AND expires_at <= $2"#,
+            )
+            .bind(user_id)
+            .bind(now)
+            .execute(db)
+            .await?;
+        }
+        if user.plan != "pro"
+            || user.plan_expires_at.map(|e| e.timestamp()) != Some(lifetime.expires_at.timestamp())
+        {
+            sqlx::query(
+                r#"UPDATE users SET plan = 'pro', plan_expires_at = $2, updated_at = now()
+                   WHERE id = $1"#,
+            )
+            .bind(user_id)
+            .bind(lifetime.expires_at)
+            .execute(db)
+            .await?;
+        }
+        return Ok(BillingState {
+            status: BillingStatus::Active,
+            plan: "pro",
+            interval: None,
+            lifetime_pro: true,
+            paid_amount_minor: None,
+            starts_at: Some(lifetime.starts_at),
+            expires_at: Some(lifetime.expires_at),
+        });
+    }
 
     let resolved = resolve_billing_state(
         latest.as_ref().map(|s| s.interval.as_str()),
@@ -238,6 +337,8 @@ pub async fn get_billing_state(db: &PgPool, user_id: &str) -> Result<BillingStat
         status: resolved.status,
         plan: resolved.plan,
         interval: resolved.interval,
+        lifetime_pro: false,
+        paid_amount_minor,
         starts_at,
         expires_at: resolved.expires_at,
     })
@@ -248,6 +349,13 @@ pub struct CheckoutQuote {
     pub blocked_message: Option<String>,
     pub interval: BillingInterval,
     pub amount_minor: i64,
+}
+
+pub struct LifetimeCheckoutQuote {
+    pub blocked: bool,
+    pub blocked_message: Option<String>,
+    pub amount_minor: i64,
+    pub credit_minor: i64,
 }
 
 fn unused_period_credit_minor(
@@ -262,6 +370,53 @@ fn unused_period_credit_minor(
     }
     let remaining = (expires_at - now).num_milliseconds().clamp(0, period);
     ((paid_minor as i128 * remaining as i128) / period as i128) as i64
+}
+
+pub fn quote_lifetime_checkout(
+    config: &AppConfig,
+    billing: &BillingState,
+    now: DateTime<Utc>,
+) -> LifetimeCheckoutQuote {
+    let full = config.plan_price_lifetime_minor;
+    if billing.lifetime_pro {
+        return LifetimeCheckoutQuote {
+            blocked: true,
+            blocked_message: Some("Lifetime Pro is already active.".to_string()),
+            amount_minor: 0,
+            credit_minor: 0,
+        };
+    }
+    if full < RAZORPAY_MIN_AMOUNT {
+        return LifetimeCheckoutQuote {
+            blocked: true,
+            blocked_message: Some("Lifetime Pro pricing is invalid.".to_string()),
+            amount_minor: 0,
+            credit_minor: 0,
+        };
+    }
+
+    let paid_price = if billing.status == BillingStatus::Active {
+        billing.interval.map(|interval| {
+            billing
+                .paid_amount_minor
+                .unwrap_or_else(|| checkout_amount_minor(config, interval))
+        })
+    } else {
+        None
+    };
+    let credit = match (paid_price, billing.starts_at, billing.expires_at) {
+        (Some(paid), Some(starts_at), Some(expires_at)) => {
+            unused_period_credit_minor(paid, starts_at, expires_at, now)
+        }
+        _ => 0,
+    };
+    let credit_minor = credit.max(0).min(full - RAZORPAY_MIN_AMOUNT);
+    LifetimeCheckoutQuote {
+        blocked: false,
+        blocked_message: None,
+        amount_minor: full - credit_minor,
+        credit_minor,
+    }
 }
 
 /// Mirrors `quoteCheckout`: computes the amount to charge for the requested
@@ -455,6 +610,204 @@ pub async fn activate_pro_subscription(
         interval,
         expires_at,
     })
+}
+
+pub struct ActivatedLifetimePurchase {
+    pub expires_at: DateTime<Utc>,
+}
+
+pub async fn activate_lifetime_purchase(
+    db: &PgPool,
+    user_id: &str,
+    gateway: &str,
+    gateway_order_id: &str,
+    gateway_payment_id: &str,
+    amount_minor: i64,
+    credit_minor: i64,
+    currency: &str,
+) -> Result<ActivatedLifetimePurchase, AppError> {
+    #[derive(sqlx::FromRow)]
+    struct ExistingPurchase {
+        user_id: String,
+        expires_at: DateTime<Utc>,
+    }
+
+    let existing = sqlx::query_as::<_, ExistingPurchase>(
+        r#"SELECT user_id, expires_at FROM lifetime_purchases
+           WHERE gateway_payment_id = $1"#,
+    )
+    .bind(gateway_payment_id)
+    .fetch_optional(db)
+    .await?;
+    if let Some(existing) = existing {
+        if existing.user_id != user_id {
+            return Err(AppError::Forbidden(
+                "Lifetime purchase belongs to a different user.".to_string(),
+            ));
+        }
+        return Ok(ActivatedLifetimePurchase {
+            expires_at: existing.expires_at,
+        });
+    }
+
+    let amount_minor = i32::try_from(amount_minor)
+        .ok()
+        .filter(|amount| *amount > 0)
+        .ok_or_else(|| AppError::BadRequest("Lifetime purchase amount is invalid.".into()))?;
+    let credit_minor = i32::try_from(credit_minor)
+        .ok()
+        .filter(|credit| *credit >= 0)
+        .ok_or_else(|| AppError::BadRequest("Lifetime credit is invalid.".into()))?;
+    let currency = currency.trim().to_uppercase();
+    if currency.is_empty() {
+        return Err(AppError::BadRequest(
+            "Lifetime purchase currency is invalid.".into(),
+        ));
+    }
+
+    let starts_at = Utc::now();
+    let expires_at = lifetime_expiry();
+    let coverage_end = expires_at - chrono::Duration::milliseconds(1);
+    let mut tx = db.begin().await?;
+    let purchase_id = cuid2::create_id();
+    let inserted = sqlx::query_scalar::<_, String>(
+        r#"INSERT INTO lifetime_purchases
+           (id, user_id, status, amount_minor, credit_minor, currency, gateway,
+            gateway_order_id, gateway_payment_id, starts_at, expires_at)
+           VALUES ($1, $2, 'active', $3, $4, $5, $6, $7, $8, $9, $10)
+           ON CONFLICT (gateway_payment_id) DO NOTHING
+           RETURNING id"#,
+    )
+    .bind(&purchase_id)
+    .bind(user_id)
+    .bind(amount_minor)
+    .bind(credit_minor)
+    .bind(&currency)
+    .bind(gateway)
+    .bind(gateway_order_id)
+    .bind(gateway_payment_id)
+    .bind(starts_at)
+    .bind(expires_at)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if inserted.is_none() {
+        let existing = sqlx::query_as::<_, ExistingPurchase>(
+            r#"SELECT user_id, expires_at FROM lifetime_purchases
+               WHERE gateway_payment_id = $1"#,
+        )
+        .bind(gateway_payment_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if existing.user_id != user_id {
+            return Err(AppError::Forbidden(
+                "Lifetime purchase belongs to a different user.".to_string(),
+            ));
+        }
+        tx.commit().await?;
+        return Ok(ActivatedLifetimePurchase {
+            expires_at: existing.expires_at,
+        });
+    }
+
+    sqlx::query(
+        r#"UPDATE users SET plan = 'pro', plan_expires_at = $2, updated_at = now()
+           WHERE id = $1"#,
+    )
+    .bind(user_id)
+    .bind(expires_at)
+    .execute(&mut *tx)
+    .await?;
+
+    let invoice_id = cuid2::create_id();
+    sqlx::query(
+        r#"INSERT INTO invoices
+           (id, user_id, subscription_id, number, interval, amount_minor, currency,
+            status, paid_at, period_start, period_end, gateway_order_id, gateway_payment_id)
+           VALUES ($1, $2, NULL, $3, 'lifetime', $4, $5, 'paid', $6, $6, $7, $8, $9)"#,
+    )
+    .bind(&invoice_id)
+    .bind(user_id)
+    .bind(invoice_number(starts_at, &purchase_id))
+    .bind(amount_minor)
+    .bind(&currency)
+    .bind(starts_at)
+    .bind(coverage_end)
+    .bind(gateway_order_id)
+    .bind(gateway_payment_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    Ok(ActivatedLifetimePurchase { expires_at })
+}
+
+pub async fn revoke_lifetime_purchase(
+    db: &PgPool,
+    gateway_payment_id: &str,
+    status: &str,
+) -> Result<bool, AppError> {
+    if status != "refunded" && status != "chargeback" {
+        return Err(AppError::BadRequest(
+            "Lifetime purchase revocation status is invalid.".to_string(),
+        ));
+    }
+
+    let now = Utc::now();
+    let mut tx = db.begin().await?;
+    let user_id = sqlx::query_scalar::<_, String>(
+        r#"UPDATE lifetime_purchases
+           SET status = $2, updated_at = now()
+           WHERE gateway_payment_id = $1 AND status = 'active'
+           RETURNING user_id"#,
+    )
+    .bind(gateway_payment_id)
+    .bind(status)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(user_id) = user_id else {
+        tx.commit().await?;
+        return Ok(false);
+    };
+
+    sqlx::query(
+        r#"UPDATE invoices SET status = $2
+           WHERE gateway_payment_id = $1"#,
+    )
+    .bind(gateway_payment_id)
+    .bind(status)
+    .execute(&mut *tx)
+    .await?;
+    let active_expiry = sqlx::query_scalar::<_, DateTime<Utc>>(
+        r#"SELECT expires_at FROM subscriptions
+           WHERE user_id = $1 AND status = 'active' AND expires_at > $2
+           ORDER BY expires_at DESC
+           LIMIT 1"#,
+    )
+    .bind(&user_id)
+    .bind(now)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(expires_at) = active_expiry {
+        sqlx::query(
+            r#"UPDATE users SET plan = 'pro', plan_expires_at = $2, updated_at = now()
+               WHERE id = $1"#,
+        )
+        .bind(&user_id)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        sqlx::query(
+            r#"UPDATE users SET plan = 'free', plan_expires_at = NULL, updated_at = now()
+               WHERE id = $1"#,
+        )
+        .bind(&user_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// A single invoice row, scoped to the user that owns it. Mirrors `InvoiceRecord`
