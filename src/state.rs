@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use sqlx::PgPool;
 
+use crate::cache::RedisCache;
 use crate::config::AppConfig;
 use crate::routes::collaboration::CollaborationHub;
 
@@ -11,4 +12,5 @@ pub struct AppState {
     pub db: PgPool,
     pub config: Arc<AppConfig>,
     pub collaboration: CollaborationHub,
+    pub cache: RedisCache,
 }

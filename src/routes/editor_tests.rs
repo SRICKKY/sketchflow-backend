@@ -106,6 +106,7 @@ async fn editor_http_flows_and_revision_checks() {
         db: db.clone(),
         config: Arc::new(config),
         collaboration: crate::routes::collaboration::CollaborationHub::default(),
+        cache: crate::cache::RedisCache::default(),
     };
     let app = router()
         .merge(crate::routes::notifications::router())

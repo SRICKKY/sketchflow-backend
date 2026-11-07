@@ -2,6 +2,7 @@ mod assets;
 mod auth;
 mod authz;
 mod billing;
+mod cache;
 mod config;
 mod db;
 mod editor;
@@ -29,6 +30,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
+use cache::RedisCache;
 use config::AppConfig;
 use state::AppState;
 
@@ -92,11 +94,28 @@ async fn main() {
             }),
         None => routes::collaboration::CollaborationHub::default(),
     };
+    let cache = match config.redis_url.as_deref() {
+        Some(redis_url) => RedisCache::connect(redis_url)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::error!(
+                    service = "sketchflow-api",
+                    environment = request_logging::app_environment(),
+                    subsystem = "cache",
+                    event = "redis_initialization_failed",
+                    error = %error,
+                    "Failed to initialize Redis API cache"
+                );
+                panic!("failed to initialize Redis API cache");
+            }),
+        None => RedisCache::default(),
+    };
 
     let state = AppState {
         db: pool,
         config: Arc::new(config.clone()),
         collaboration,
+        cache,
     };
 
     let cleanup_db = state.db.clone();

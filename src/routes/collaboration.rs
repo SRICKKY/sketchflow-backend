@@ -35,6 +35,7 @@ const MAX_BATCH_ELEMENTS: usize = 500;
 const MAX_SELECTION_SIZE: usize = 100;
 const ROOM_CAPACITY: usize = 256;
 const MAX_MESSAGES_PER_SECOND: usize = 60;
+const SNAPSHOT_CACHE_TTL_SECONDS: u64 = 30;
 
 // Version the JSON protocol and shared Redis channel independently of the HTTP API.
 const PROTOCOL_VERSION: u64 = 1;
@@ -350,7 +351,7 @@ enum ServerMessage {
 }
 
 /// REST response body containing a consistent board snapshot and its revision.
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotResponse {
     pub board_id: String,
@@ -385,8 +386,65 @@ pub async fn snapshot(
     // Viewer permission is enough to read a document, but never to submit edits.
     let user = session::require_current_user(&cookies, &state).await?;
     authz::require_board_role(&state.db, &board_id, &user.id, BoardRole::Viewer).await?;
+
+    let revision = sqlx::query_scalar::<_, i64>(
+        "SELECT revision FROM board_collaboration_state WHERE board_id = $1",
+    )
+    .bind(&board_id)
+    .fetch_optional(&state.db)
+    .await?;
+    if let Some(revision) = revision {
+        let cache_key = snapshot_cache_key(&board_id, revision);
+        match state.cache.get_json::<SnapshotResponse>(&cache_key).await {
+            Ok(Some(snapshot))
+                if snapshot.board_id == board_id && snapshot.revision == revision =>
+            {
+                return Ok(Json(snapshot));
+            }
+            Ok(Some(_)) => tracing::warn!(
+                subsystem = "cache",
+                event = "redis_cache_value_mismatch",
+                cache = "board_snapshot",
+                "Ignoring snapshot cache entry with mismatched revision"
+            ),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                subsystem = "cache",
+                event = "redis_cache_read_failed",
+                cache = "board_snapshot",
+                %error,
+                "Falling back to PostgreSQL for board snapshot"
+            ),
+        }
+    }
+
     let result = load_snapshot(&state, &board_id).await?;
+    let cache_key = snapshot_cache_key(&board_id, result.revision);
+    if let Err(error) = state
+        .cache
+        .set_json(
+            &cache_key,
+            &result,
+            Duration::from_secs(SNAPSHOT_CACHE_TTL_SECONDS),
+        )
+        .await
+    {
+        tracing::warn!(
+            subsystem = "cache",
+            event = "redis_cache_write_failed",
+            cache = "board_snapshot",
+            %error,
+            "Board snapshot was not cached"
+        );
+    }
     Ok(Json(result))
+}
+
+fn snapshot_cache_key(board_id: &str, revision: i64) -> String {
+    format!(
+        "sketchflow:api-cache:v1:{}:board-snapshot:{board_id}:{revision}",
+        crate::request_logging::app_environment()
+    )
 }
 
 /// Opens an authenticated, board-scoped WebSocket for document operations and presence.

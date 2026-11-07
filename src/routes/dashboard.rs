@@ -121,9 +121,16 @@ struct Capabilities {
     can_save_templates: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DashboardCounts {
+    favorites: i64,
+    trash: i64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct CachedDashboardCounts {
+    owned_boards: i64,
     favorites: i64,
     trash: i64,
 }
@@ -176,9 +183,25 @@ struct Template {
     element_count: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct Items<T> {
     items: Vec<T>,
+}
+
+async fn invalidate_template_cache(cache: &crate::cache::RedisCache, user_id: &str) {
+    let cache_key = format!(
+        "sketchflow:api-cache:v1:{}:templates:{user_id}",
+        crate::request_logging::app_environment()
+    );
+    if let Err(error) = cache.delete(&cache_key).await {
+        tracing::warn!(
+            subsystem = "cache",
+            event = "redis_cache_invalidation_failed",
+            cache = "user_templates",
+            %error,
+            "Saved-template cache will expire by TTL"
+        );
+    }
 }
 
 #[derive(Serialize)]
@@ -416,8 +439,12 @@ async fn lock_resource(
     Ok(())
 }
 
-async fn workspace_list(db: &PgPool, user_id: &str) -> AppResult<Vec<WorkspaceSummary>> {
-    if !is_pro(db, user_id).await? {
+async fn workspace_list(
+    db: &PgPool,
+    user_id: &str,
+    is_pro: bool,
+) -> AppResult<Vec<WorkspaceSummary>> {
+    if !is_pro {
         return Ok(vec![]);
     }
     Ok(sqlx::query_as(
@@ -431,41 +458,89 @@ async fn dashboard(
 ) -> AppResult<Json<DashboardResponse>> {
     let user = session::require_current_user(&cookies, &state).await?;
     let pro = is_pro(&state.db, &user.id).await?;
-    let count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM boards WHERE owner_id=$1 AND workspace_id IS NULL",
-    )
-    .bind(&user.id)
-    .fetch_one(&state.db)
-    .await?;
-    let (favorites, trash): (i64, i64) = sqlx::query_as(
-        "SELECT
-            (SELECT count(DISTINCT b.id)
-             FROM board_favorites favorite
-             JOIN boards b ON b.id=favorite.board_id
-             LEFT JOIN board_members m ON m.board_id=b.id AND m.user_id=$1
-             LEFT JOIN workspace_members wm ON wm.workspace_id=b.workspace_id AND wm.user_id=$1
-             WHERE favorite.user_id=$1 AND b.deleted_at IS NULL
-               AND (b.owner_id=$1 OR m.id IS NOT NULL OR ($2::boolean AND wm.user_id=$1))),
-            (SELECT count(*) FROM boards b WHERE b.owner_id=$1 AND b.deleted_at IS NOT NULL)",
-    )
-    .bind(&user.id)
-    .bind(pro)
-    .fetch_one(&state.db)
-    .await?;
+    let counts_key = format!(
+        "sketchflow:api-cache:v1:{}:dashboard-counts:{}",
+        crate::request_logging::app_environment(),
+        user.id
+    );
+    let cached_counts = match state
+        .cache
+        .get_json::<CachedDashboardCounts>(&counts_key)
+        .await
+    {
+        Ok(cached) => cached,
+        Err(error) => {
+            tracing::warn!(
+                subsystem = "cache",
+                event = "redis_cache_read_failed",
+                cache = "dashboard_counts",
+                %error,
+                "Falling back to PostgreSQL for dashboard counts"
+            );
+            None
+        }
+    };
+    let counts = if let Some(counts) = cached_counts {
+        counts
+    } else {
+        let owned_boards: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM boards WHERE owner_id=$1 AND workspace_id IS NULL",
+        )
+        .bind(&user.id)
+        .fetch_one(&state.db)
+        .await?;
+        let (favorites, trash): (i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT count(DISTINCT b.id)
+                 FROM board_favorites favorite
+                 JOIN boards b ON b.id=favorite.board_id
+                 LEFT JOIN board_members m ON m.board_id=b.id AND m.user_id=$1
+                 LEFT JOIN workspace_members wm ON wm.workspace_id=b.workspace_id AND wm.user_id=$1
+                 WHERE favorite.user_id=$1 AND b.deleted_at IS NULL
+                   AND (b.owner_id=$1 OR m.id IS NOT NULL OR ($2::boolean AND wm.user_id=$1))),
+                (SELECT count(*) FROM boards b WHERE b.owner_id=$1 AND b.deleted_at IS NOT NULL)",
+        )
+        .bind(&user.id)
+        .bind(pro)
+        .fetch_one(&state.db)
+        .await?;
+        let counts = CachedDashboardCounts {
+            owned_boards,
+            favorites,
+            trash,
+        };
+        if let Err(error) = state
+            .cache
+            .set_json(&counts_key, &counts, std::time::Duration::from_secs(5))
+            .await
+        {
+            tracing::warn!(
+                subsystem = "cache",
+                event = "redis_cache_write_failed",
+                cache = "dashboard_counts",
+                %error,
+                "Dashboard counts were not cached"
+            );
+        }
+        counts
+    };
     Ok(Json(DashboardResponse {
         capabilities: Capabilities {
             is_pro: pro,
-            owned_boards: count,
+            owned_boards: counts.owned_boards,
             max_owned_boards: if pro {
                 None
             } else {
                 Some(FREE_MAX_OWNED_BOARDS)
             },
-            can_create_board: pro || count < FREE_MAX_OWNED_BOARDS,
+            can_create_board: pro || counts.owned_boards < FREE_MAX_OWNED_BOARDS,
             can_save_templates: pro,
         },
-        workspaces: workspace_list(&state.db, &user.id).await?,
-        counts: DashboardCounts { favorites, trash },
+        workspaces: workspace_list(&state.db, &user.id, pro).await?,
+        counts: DashboardCounts {
+            favorites: counts.favorites,
+            trash: counts.trash,
+        },
     }))
 }
 
@@ -1057,6 +1132,23 @@ async fn list_templates(
     cookies: Cookies,
 ) -> AppResult<Json<Items<Template>>> {
     let user = session::require_current_user(&cookies, &state).await?;
+    let cache_key = format!(
+        "sketchflow:api-cache:v1:{}:templates:{}",
+        crate::request_logging::app_environment(),
+        user.id
+    );
+    match state.cache.get_json::<Items<Template>>(&cache_key).await {
+        Ok(Some(items)) => return Ok(Json(items)),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            subsystem = "cache",
+            event = "redis_cache_read_failed",
+            cache = "user_templates",
+            %error,
+            "Falling back to PostgreSQL for templates"
+        ),
+    }
+
     let mut items = builtin_templates();
     let rows: Vec<(String,String,Option<String>,String,i32)> = sqlx::query_as(
         "SELECT id,name,description,category,jsonb_array_length(elements) FROM board_templates WHERE created_by_id=$1 ORDER BY created_at DESC,id"
@@ -1073,7 +1165,21 @@ async fn list_templates(
                 element_count: count as usize,
             }),
     );
-    Ok(Json(Items { items }))
+    let items = Items { items };
+    if let Err(error) = state
+        .cache
+        .set_json(&cache_key, &items, std::time::Duration::from_secs(60))
+        .await
+    {
+        tracing::warn!(
+            subsystem = "cache",
+            event = "redis_cache_write_failed",
+            cache = "user_templates",
+            %error,
+            "Templates were not cached"
+        );
+    }
+    Ok(Json(items))
 }
 
 async fn save_template(
@@ -1103,6 +1209,7 @@ async fn save_template(
     sqlx::query("INSERT INTO board_templates(id,name,description,created_by_id,elements) VALUES($1,$2,$3,$4,$5)")
         .bind(&template_id).bind(&name).bind(&description).bind(&user.id).bind(json!(elements)).execute(&mut *tx).await?;
     tx.commit().await?;
+    invalidate_template_cache(&state.cache, &user.id).await;
     Ok((
         StatusCode::CREATED,
         Json(Template {
@@ -1131,12 +1238,13 @@ async fn delete_template(
 
     let result = sqlx::query("DELETE FROM board_templates WHERE id=$1 AND created_by_id=$2")
         .bind(template_id)
-        .bind(user.id)
+        .bind(&user.id)
         .execute(&state.db)
         .await?;
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("Template not found".into()));
     }
+    invalidate_template_cache(&state.cache, &user.id).await;
     Ok(Json(json!({"success":true})))
 }
 
@@ -1167,6 +1275,7 @@ async fn import_template(
     let template_id = id();
     sqlx::query("INSERT INTO board_templates(id,name,description,created_by_id,elements) VALUES($1,$2,$3,$4,$5)")
             .bind(&template_id).bind(&name).bind(&description).bind(&user.id).bind(json!(input.elements)).execute(&state.db).await?;
+    invalidate_template_cache(&state.cache, &user.id).await;
     Ok((
         StatusCode::CREATED,
         Json(Template {
@@ -1185,8 +1294,9 @@ async fn list_workspaces(
     cookies: Cookies,
 ) -> AppResult<Json<Items<WorkspaceSummary>>> {
     let user = session::require_current_user(&cookies, &state).await?;
+    let pro = is_pro(&state.db, &user.id).await?;
     Ok(Json(Items {
-        items: workspace_list(&state.db, &user.id).await?,
+        items: workspace_list(&state.db, &user.id, pro).await?,
     }))
 }
 

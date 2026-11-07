@@ -155,6 +155,7 @@ async fn dashboard_http_flows_and_authorization() {
         db: db.clone(),
         config: Arc::new(config),
         collaboration: super::super::collaboration::CollaborationHub::default(),
+        cache: crate::cache::RedisCache::default(),
     };
     let app = router()
         .merge(super::super::editor::router())
