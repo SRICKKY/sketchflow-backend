@@ -1022,6 +1022,7 @@ mod tests {
             db: db.clone(),
             config: Arc::new(config),
             collaboration: crate::routes::collaboration::CollaborationHub::default(),
+            cache: crate::cache::RedisCache::default(),
         };
         let app = crate::routes::dashboard::router()
             .merge(crate::routes::editor::router())
