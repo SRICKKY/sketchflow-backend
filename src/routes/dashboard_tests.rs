@@ -56,6 +56,22 @@ fn validates_opaque_board_cursor() {
 }
 
 #[test]
+fn owned_board_list_cache_is_user_scoped_and_serializable() {
+    let user_a_key = owned_boards_first_page_cache_key("user-a");
+    let user_b_key = owned_boards_first_page_cache_key("user-b");
+    assert_ne!(user_a_key, user_b_key);
+
+    let page = BoardPage {
+        items: Vec::new(),
+        next_cursor: None,
+    };
+    let serialized = serde_json::to_string(&page).unwrap();
+    let cached: BoardPage = serde_json::from_str(&serialized).unwrap();
+    assert!(cached.items.is_empty());
+    assert!(cached.next_cursor.is_none());
+}
+
+#[test]
 fn actual_builtins_remint_ids_and_bindings() {
     let templates = builtin_templates();
     assert_eq!(templates.len(), 7);
