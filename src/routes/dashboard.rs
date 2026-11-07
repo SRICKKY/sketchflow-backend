@@ -88,7 +88,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/workspaces/{id}/leave", post(leave_workspace))
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Deserialize, Serialize, FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct BoardSummary {
     id: String,
@@ -204,7 +204,27 @@ async fn invalidate_template_cache(cache: &crate::cache::RedisCache, user_id: &s
     }
 }
 
-#[derive(Serialize)]
+fn owned_boards_first_page_cache_key(user_id: &str) -> String {
+    format!(
+        "sketchflow:api-cache:v1:{}:owned-boards:first-page:{user_id}",
+        crate::request_logging::app_environment()
+    )
+}
+
+async fn invalidate_owned_boards_first_page_cache(cache: &crate::cache::RedisCache, user_id: &str) {
+    let cache_key = owned_boards_first_page_cache_key(user_id);
+    if let Err(error) = cache.delete(&cache_key).await {
+        tracing::warn!(
+            subsystem = "cache",
+            event = "redis_cache_invalidation_failed",
+            cache = "owned_boards_first_page",
+            %error,
+            "Owned-board list cache will expire by TTL"
+        );
+    }
+}
+
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BoardPage {
     items: Vec<BoardSummary>,
@@ -617,6 +637,32 @@ async fn list_boards(
     } else {
         false
     };
+    let cache_key = if scope == "owned"
+        && limit == 12
+        && cursor.is_none()
+        && workspace.is_none()
+        && collection_id.is_none()
+        && query.q.as_deref().map_or(true, |q| q.trim().is_empty())
+    {
+        Some(owned_boards_first_page_cache_key(&user.id))
+    } else {
+        None
+    };
+    if let Some(cache_key) = &cache_key {
+        match state.cache.get_json::<BoardPage>(cache_key).await {
+            Ok(Some(page)) => return Ok(Json(page)),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    subsystem = "cache",
+                    event = "redis_cache_read_failed",
+                    cache = "owned_boards_first_page",
+                    %error,
+                    "Falling back to PostgreSQL for owned boards"
+                );
+            }
+        }
+    }
     let condition = if workspace.is_some() {
         "b.deleted_at IS NULL AND b.workspace_id=$2"
     } else if scope == "shared" {
@@ -653,7 +699,23 @@ async fn list_boards(
     } else {
         None
     };
-    Ok(Json(BoardPage { items, next_cursor }))
+    let page = BoardPage { items, next_cursor };
+    if let Some(cache_key) = cache_key {
+        if let Err(error) = state
+            .cache
+            .set_json(&cache_key, &page, std::time::Duration::from_secs(5))
+            .await
+        {
+            tracing::warn!(
+                subsystem = "cache",
+                event = "redis_cache_write_failed",
+                cache = "owned_boards_first_page",
+                %error,
+                "Owned-board list was not cached"
+            );
+        }
+    }
+    Ok(Json(page))
 }
 
 async fn get_board(
@@ -813,6 +875,9 @@ async fn insert_board(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    if workspace.is_none() {
+        invalidate_owned_boards_first_page_cache(&state.cache, user_id).await;
+    }
     board_summary(&state.db, &board_id, user_id).await
 }
 
@@ -881,6 +946,7 @@ async fn rename_board(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    invalidate_owned_boards_first_page_cache(&state.cache, &user.id).await;
     Ok(Json(board_summary(&state.db, &board_id, &user.id).await?))
 }
 
@@ -898,6 +964,7 @@ async fn delete_board(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    invalidate_owned_boards_first_page_cache(&state.cache, &user.id).await;
     Ok(Json(json!({"success":true})))
 }
 
@@ -928,6 +995,7 @@ async fn restore_board(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    invalidate_owned_boards_first_page_cache(&state.cache, &user.id).await;
     Ok(Json(json!({"success":true})))
 }
 
@@ -960,6 +1028,7 @@ async fn permanently_delete_board(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    invalidate_owned_boards_first_page_cache(&state.cache, &user.id).await;
     Ok(Json(json!({"success":true})))
 }
 
@@ -977,6 +1046,7 @@ async fn favorite_board(
     .bind(&board_id)
     .execute(&state.db)
     .await?;
+    invalidate_owned_boards_first_page_cache(&state.cache, &user.id).await;
     Ok(Json(json!({"success":true,"isFavorite":true})))
 }
 
@@ -992,6 +1062,7 @@ async fn unfavorite_board(
         .bind(&board_id)
         .execute(&state.db)
         .await?;
+    invalidate_owned_boards_first_page_cache(&state.cache, &user.id).await;
     Ok(Json(json!({"success":true,"isFavorite":false})))
 }
 

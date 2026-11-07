@@ -9,6 +9,7 @@ for credentials; never commit the connection URL.
 | Data | Key scope | TTL | Freshness behavior |
 | --- | --- | --- | --- |
 | Dashboard counts | User | 5 seconds | Counts may lag briefly; billing state and workspace membership are still read from PostgreSQL. |
+| Owned board list first page (`scope=owned&limit=12`) | User | 5 seconds | Only the unfiltered first page is cached; create, duplicate, rename, delete, restore, and favorite changes invalidate it. The next GET refills it from PostgreSQL. |
 | Saved-template list | User | 60 seconds | The cache is deleted after save, import, and delete operations. |
 | Collaboration snapshot elements | Board and current revision | 30 seconds | Authorization and current revision are checked before a cache hit is used; older revisions have separate keys and expire. |
 
@@ -17,12 +18,15 @@ after startup, the handler logs a warning and continues with PostgreSQL. With
 `REDIS_URL` configured, Redis initialization at startup remains required by
 the existing collaboration Pub/Sub setup.
 
-Board lists, notifications, public-link responses, authentication, permissions,
-billing state, and mutations are not response-cached. In particular, public
-responses retain their existing `no-store` behavior.
+Other board-list query variants, notifications, public-link responses,
+authentication, permissions, billing state, and mutations are not
+response-cached. In particular, public responses retain their existing
+`no-store` behavior.
 
 ## Local Compose
 
-Compose defaults to its local Redis service. To use a different Redis instance,
-set `REDIS_URL` in the local environment; Compose passes it through to the
-backend. For hosted Redis, use a TLS URL (`rediss://`) and a rotated credential.
+Compose always connects the backend to its local Redis service at
+`redis://redis:6379`, even if `REDIS_URL` is set in the host environment or
+`.env` file. When running the backend outside Compose, set `REDIS_URL` directly
+to select a Redis instance. For hosted Redis, use a TLS URL (`rediss://`) and a
+rotated credential.
