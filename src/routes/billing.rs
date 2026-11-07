@@ -76,6 +76,9 @@ pub struct CreateOrderRequest {
     /// `"month"` or `"year"`.
     #[serde(default)]
     pub interval: Option<String>,
+    /// `"lifetime"` for the one-time Lifetime Pro purchase.
+    #[serde(default)]
+    pub plan: Option<String>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -119,8 +122,22 @@ pub struct BillingOverviewResponse {
     pub status: String,
     pub plan: String,
     pub interval: Option<String>,
+    #[serde(rename = "lifetimePro")]
+    pub lifetime_pro: bool,
     pub starts_at: Option<String>,
     pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct LifetimeUpgradeQuoteResponse {
+    pub eligible: bool,
+    #[serde(rename = "lifetimePriceMinor")]
+    pub lifetime_price_minor: Option<i64>,
+    #[serde(rename = "unusedCreditMinor")]
+    pub unused_credit_minor: Option<i64>,
+    #[serde(rename = "amountDueMinor")]
+    pub amount_due_minor: Option<i64>,
+    pub currency: Option<String>,
 }
 
 /// Return the signed-in user's current billing period and plan status.
@@ -151,8 +168,64 @@ pub async fn billing_overview(
         status: status.to_string(),
         plan: billing.plan.to_string(),
         interval: billing.interval.map(|value| value.as_str().to_string()),
+        lifetime_pro: billing.lifetime_pro,
         starts_at: billing.starts_at.map(|value| value.to_rfc3339()),
         expires_at: billing.expires_at.map(|value| value.to_rfc3339()),
+    }))
+}
+
+/// Return an exact quote for Lifetime Pro, including any unused paid-time credit.
+#[utoipa::path(
+    get,
+    path = "/api/billing/lifetime-upgrade-quote",
+    tag = "billing",
+    responses(
+        (status = 200, description = "Lifetime Pro checkout quote", body = LifetimeUpgradeQuoteResponse),
+        (status = 401, description = "Not signed in"),
+        (status = 503, description = "Lifetime Pro price is invalid")
+    )
+)]
+pub async fn lifetime_upgrade_quote(
+    State(state): State<AppState>,
+    cookies: Cookies,
+) -> AppResult<Json<LifetimeUpgradeQuoteResponse>> {
+    let user = session::optional_current_user(&cookies, &state)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("Sign in to view Lifetime Pro pricing.".into()))?;
+    let billing_state = get_billing_state(&state.db, &user.id).await?;
+    let quote = billing::quote_lifetime_checkout(&state.config, &billing_state, Utc::now());
+    if quote.blocked {
+        return Ok(Json(LifetimeUpgradeQuoteResponse {
+            eligible: false,
+            lifetime_price_minor: None,
+            unused_credit_minor: None,
+            amount_due_minor: None,
+            currency: None,
+        }));
+    }
+
+    let lifetime_price_minor =
+        billing::paddle::checkout_amount_to_paddle_minor(state.config.plan_price_lifetime_minor)
+            .ok_or_else(|| {
+                AppError::ServiceUnavailable("Lifetime Pro price is not configured.".to_string())
+            })?;
+    let amount_due_minor = billing::paddle::checkout_amount_to_paddle_minor(quote.amount_minor)
+        .ok_or_else(|| {
+            AppError::ServiceUnavailable("Lifetime Pro amount is invalid.".to_string())
+        })?;
+    let unused_credit_minor = lifetime_price_minor
+        .checked_sub(amount_due_minor)
+        .filter(|credit| *credit >= 0)
+        .ok_or_else(|| {
+            AppError::ServiceUnavailable("Lifetime Pro quote is inconsistent.".to_string())
+        })?;
+
+    Ok(Json(LifetimeUpgradeQuoteResponse {
+        eligible: true,
+        lifetime_price_minor: Some(lifetime_price_minor),
+        unused_credit_minor: Some(unused_credit_minor),
+        amount_due_minor: Some(amount_due_minor),
+        currency: Some("USD".to_string()),
     }))
 }
 
@@ -259,6 +332,94 @@ pub async fn create_order(
     let user = session::optional_current_user(&cookies, &state)
         .await?
         .ok_or_else(|| AppError::Unauthorized("Sign in to upgrade to Pro.".to_string()))?;
+
+    if let Some(plan) = body.plan.as_deref() {
+        if plan != "lifetime" || body.interval.is_some() {
+            return Err(AppError::BadRequest(
+                "plan must be lifetime and cannot be combined with interval.".to_string(),
+            ));
+        }
+
+        let billing_state = get_billing_state(&state.db, &user.id).await?;
+        let quote = billing::quote_lifetime_checkout(&state.config, &billing_state, Utc::now());
+        if quote.blocked {
+            return Err(AppError::Conflict(
+                quote
+                    .blocked_message
+                    .unwrap_or_else(|| "Lifetime Pro is already active.".to_string()),
+            ));
+        }
+
+        if state.config.payment_gateway == "paddle" {
+            let checkout = billing::paddle::create_lifetime_transaction(
+                &state.config,
+                quote.amount_minor,
+                quote.credit_minor,
+                &user.id,
+            )
+            .await?;
+            attempt.succeed();
+            return Ok(Json(CreateOrderResponse {
+                gateway: "paddle".to_string(),
+                id: None,
+                amount: None,
+                currency: None,
+                key: None,
+                transaction_id: Some(checkout.transaction_id),
+                client_token: Some(checkout.client_token),
+                environment: Some(checkout.environment),
+            }));
+        }
+        if state.config.payment_gateway != "razorpay" {
+            return Err(AppError::ServiceUnavailable(format!(
+                "Unsupported payment gateway '{}'.",
+                state.config.payment_gateway
+            )));
+        }
+        if quote.amount_minor < billing::RAZORPAY_MIN_AMOUNT {
+            return Err(AppError::BadRequest(
+                "Amount must be at least 100 (smallest currency unit).".to_string(),
+            ));
+        }
+        let key = razorpay::checkout_key_id(&state.config)
+            .filter(|key| !key.trim().is_empty())
+            .ok_or_else(|| {
+                AppError::ServiceUnavailable("RAZORPAY_KEY_ID is not configured.".to_string())
+            })?;
+        let mut notes = HashMap::new();
+        notes.insert("sketchflowUserId".to_string(), user.id.clone());
+        notes.insert("planInterval".to_string(), "lifetime".to_string());
+        notes.insert(
+            "expectedAmountMinor".to_string(),
+            quote.amount_minor.to_string(),
+        );
+        notes.insert("creditMinor".to_string(), quote.credit_minor.to_string());
+        let now = Utc::now();
+        let receipt = format!(
+            "sf_{}_{}",
+            &user.id[user.id.len().saturating_sub(10)..],
+            to_base36(now.timestamp_millis())
+        );
+        let order = razorpay::create_order(
+            &state.config,
+            quote.amount_minor,
+            &state.config.checkout_currency,
+            &receipt,
+            notes,
+        )
+        .await?;
+        attempt.succeed();
+        return Ok(Json(CreateOrderResponse {
+            gateway: "razorpay".to_string(),
+            id: Some(order.id),
+            amount: Some(order.amount),
+            currency: Some(order.currency),
+            key: Some(key),
+            transaction_id: None,
+            client_token: None,
+            environment: None,
+        }));
+    }
 
     let interval_str = body.interval.as_deref().unwrap_or("");
     if interval_str != "month" && interval_str != "year" {
@@ -492,6 +653,11 @@ pub async fn paddle_webhook(
     let event_type = event.get("event_type").and_then(Value::as_str);
     if event_type == Some("transaction.completed") {
         attempt.set_event_type("transaction.completed");
+    } else if matches!(
+        event_type,
+        Some("adjustment.created") | Some("adjustment.updated")
+    ) {
+        attempt.set_event_type("adjustment");
     } else if event_type.is_some() {
         attempt.set_event_type("other");
     }
@@ -506,6 +672,33 @@ pub async fn paddle_webhook(
             })?;
         billing::paddle::complete_transaction(&state.db, &state.config, transaction_id, None)
             .await?;
+    } else if matches!(
+        event_type,
+        Some("adjustment.created") | Some("adjustment.updated")
+    ) {
+        let data = event.get("data");
+        let action = data
+            .and_then(|data| data.get("action"))
+            .and_then(Value::as_str);
+        let status = data
+            .and_then(|data| data.get("status"))
+            .and_then(Value::as_str);
+        let transaction_id = data
+            .and_then(|data| data.get("transaction_id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty());
+        if let (Some(action), Some(transaction_id)) = (action, transaction_id) {
+            let revoke_status = if action == "chargeback" {
+                Some("chargeback")
+            } else if action == "refund" && status == Some("approved") {
+                Some("refunded")
+            } else {
+                None
+            };
+            if let Some(revoke_status) = revoke_status {
+                billing::revoke_lifetime_purchase(&state.db, transaction_id, revoke_status).await?;
+            }
+        }
     }
 
     attempt.succeed();
@@ -585,6 +778,55 @@ pub async fn verify_payment(
                 "Payment does not belong to this user.".to_string(),
             ));
         }
+    }
+
+    if order.notes.get("planInterval").map(String::as_str) == Some("lifetime") {
+        let expected_amount = order
+            .notes
+            .get("expectedAmountMinor")
+            .and_then(|value| value.parse::<i64>().ok());
+        let credit_minor = order
+            .notes
+            .get("creditMinor")
+            .and_then(|value| value.parse::<i64>().ok());
+        let full_amount = state.config.plan_price_lifetime_minor;
+        if order.notes.get("sketchflowUserId") != Some(&user.id)
+            || expected_amount != Some(payment.amount)
+            || order.amount != payment.amount
+            || payment.currency.trim().to_uppercase()
+                != state.config.checkout_currency.trim().to_uppercase()
+            || expected_amount
+                .is_none_or(|amount| amount < billing::RAZORPAY_MIN_AMOUNT || amount > full_amount)
+            || credit_minor
+                .and_then(|credit| expected_amount.and_then(|amount| amount.checked_add(credit)))
+                != Some(full_amount)
+        {
+            return Err(AppError::BadRequest(
+                "Razorpay Lifetime Pro order amount or currency is invalid.".to_string(),
+            ));
+        }
+
+        let activated = billing::activate_lifetime_purchase(
+            &state.db,
+            &user.id,
+            "razorpay",
+            order_id,
+            payment_id,
+            payment.amount,
+            credit_minor.unwrap_or_default(),
+            &payment.currency,
+        )
+        .await?;
+        attempt.succeed();
+        return Ok(Json(VerifyPaymentResponse {
+            success: true,
+            status: payment.status,
+            plan: "pro".to_string(),
+            interval: "lifetime".to_string(),
+            expires_at: activated
+                .expires_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        }));
     }
 
     let interval = BillingInterval::parse_opt(order.notes.get("planInterval").map(String::as_str));

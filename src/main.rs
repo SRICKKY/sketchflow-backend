@@ -186,6 +186,10 @@ async fn main() {
             "/api/billing/annual-upgrade-quote",
             get(routes::billing::annual_upgrade_quote),
         )
+        .route(
+            "/api/billing/lifetime-upgrade-quote",
+            get(routes::billing::lifetime_upgrade_quote),
+        )
         .route("/api/create-order", post(routes::billing::create_order))
         .route("/api/verify-payment", post(routes::billing::verify_payment))
         .route(

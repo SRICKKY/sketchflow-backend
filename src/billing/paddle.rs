@@ -122,6 +122,19 @@ fn configured_price_id(config: &AppConfig, interval: BillingInterval) -> Result<
     Ok(id)
 }
 
+fn configured_lifetime_price_id(config: &AppConfig) -> Result<&str, AppError> {
+    let id = required_config(
+        config.paddle_price_id_lifetime.as_deref(),
+        "PADDLE_PRICE_ID_LIFETIME",
+    )?;
+    if !valid_path_id(id) {
+        return Err(AppError::ServiceUnavailable(
+            "PADDLE_PRICE_ID_LIFETIME is invalid.".to_string(),
+        ));
+    }
+    Ok(id)
+}
+
 fn valid_path_id(value: &str) -> bool {
     !value.is_empty()
         && value
@@ -135,6 +148,10 @@ fn expected_catalog_amount_minor(config: &AppConfig, interval: BillingInterval) 
         BillingInterval::Year => config.plan_price_year_minor,
     };
     ((i128::from(inr_minor) + 50) / 100).clamp(0, i128::from(i64::MAX)) as i64
+}
+
+fn expected_lifetime_catalog_amount_minor(config: &AppConfig) -> i64 {
+    checkout_amount_to_paddle_minor(config.plan_price_lifetime_minor).unwrap_or(0)
 }
 
 pub fn checkout_amount_to_paddle_minor(amount_minor: i64) -> Option<i64> {
@@ -237,6 +254,35 @@ async fn validate_price(
     Ok(())
 }
 
+async fn validate_lifetime_price(config: &AppConfig, price_id: &str) -> Result<(), AppError> {
+    let value = paddle_request(
+        config,
+        &format!("/prices/{price_id}"),
+        reqwest::Method::GET,
+        None,
+        None,
+    )
+    .await?;
+    let price: PaddlePrice = serde_json::from_value(
+        value
+            .get("data")
+            .cloned()
+            .ok_or_else(|| AppError::Gateway(502, "Paddle price response is invalid.".into()))?,
+    )
+    .map_err(|_| AppError::Gateway(502, "Paddle price response is invalid.".into()))?;
+    if price.id != price_id
+        || !price.billing_cycle.is_null()
+        || price.unit_price.currency_code != "USD"
+        || price.unit_price.amount.parse::<i64>().ok()
+            != Some(expected_lifetime_catalog_amount_minor(config))
+    {
+        return Err(AppError::ServiceUnavailable(
+            "Paddle lifetime price must be a one-time USD price for $300.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn create_transaction(
     config: &AppConfig,
     amount_minor: i64,
@@ -289,6 +335,77 @@ pub async fn create_transaction(
         reqwest::Method::POST,
         Some(body),
         Some(&idempotency_key),
+    )
+    .await?;
+    let transaction_id = value
+        .get("data")
+        .and_then(|data| data.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| id.starts_with("txn_") && valid_path_id(id))
+        .ok_or_else(|| {
+            AppError::Gateway(502, "Paddle returned an invalid transaction ID.".into())
+        })?;
+
+    Ok(PaddleCheckout {
+        transaction_id: transaction_id.to_string(),
+        client_token: client_token.to_string(),
+        environment: environment.to_string(),
+    })
+}
+
+pub async fn create_lifetime_transaction(
+    config: &AppConfig,
+    amount_minor: i64,
+    credit_minor: i64,
+    user_id: &str,
+) -> Result<PaddleCheckout, AppError> {
+    let environment = config.paddle_environment.as_str();
+    let client_token =
+        required_config(config.paddle_client_token.as_deref(), "PADDLE_CLIENT_TOKEN")?;
+    let price_id = configured_lifetime_price_id(config)?;
+    let expected_amount = checkout_amount_to_paddle_minor(amount_minor)
+        .ok_or_else(|| AppError::BadRequest("Paddle checkout amount is invalid.".into()))?;
+    let catalog_amount = expected_lifetime_catalog_amount_minor(config);
+    if credit_minor < 0
+        || amount_minor
+            .checked_add(credit_minor)
+            .filter(|total| *total == config.plan_price_lifetime_minor)
+            .is_none()
+        || expected_amount <= 0
+        || expected_amount > catalog_amount
+    {
+        return Err(AppError::BadRequest(
+            "Paddle Lifetime Pro checkout amount is invalid.".to_string(),
+        ));
+    }
+    validate_lifetime_price(config, price_id).await?;
+
+    let discount = catalog_amount - expected_amount;
+    let mut body = json!({
+        "collection_mode": "automatic",
+        "currency_code": "USD",
+        "items": [{ "price_id": price_id, "quantity": 1 }],
+        "custom_data": {
+            "sketchflow_user_id": user_id,
+            "sketchflow_plan": "lifetime",
+            "sketchflow_expected_amount_minor": expected_amount.to_string()
+        }
+    });
+    if discount > 0 {
+        body["discount"] = json!({
+            "description": "Unused Pro time credit",
+            "type": "flat",
+            "amount": discount.to_string(),
+            "recur": false
+        });
+    }
+
+    let value = paddle_request(
+        config,
+        "/transactions",
+        reqwest::Method::POST,
+        Some(body),
+        Some(&cuid2::create_id()),
     )
     .await?;
     let transaction_id = value
@@ -372,9 +489,15 @@ async fn fetch_transaction(
     .map_err(|_| AppError::Gateway(502, "Paddle transaction response is invalid.".into()))
 }
 
+#[derive(Clone, Copy)]
+enum PaddleProduct {
+    Lifetime,
+    Subscription(BillingInterval),
+}
+
 fn transaction_custom_data(
     transaction: &PaddleTransaction,
-) -> Result<(String, BillingInterval, i64, bool), AppError> {
+) -> Result<(String, PaddleProduct, i64, bool), AppError> {
     let custom_data = transaction
         .custom_data
         .as_ref()
@@ -389,9 +512,16 @@ fn transaction_custom_data(
         .ok_or_else(|| {
             AppError::BadRequest("Paddle transaction is missing valid plan details.".into())
         })?;
-    let interval = parse_interval(custom_data.get("sketchflow_interval")).ok_or_else(|| {
-        AppError::BadRequest("Paddle transaction is missing valid plan details.".into())
-    })?;
+    let product = if custom_data.get("sketchflow_plan").and_then(Value::as_str) == Some("lifetime")
+    {
+        PaddleProduct::Lifetime
+    } else {
+        PaddleProduct::Subscription(
+            parse_interval(custom_data.get("sketchflow_interval")).ok_or_else(|| {
+                AppError::BadRequest("Paddle transaction is missing valid plan details.".into())
+            })?,
+        )
+    };
     let expected_amount = parse_minor_amount(custom_data.get("sketchflow_expected_amount_minor"))
         .ok_or_else(|| {
         AppError::BadRequest("Paddle transaction plan amount is invalid.".into())
@@ -402,7 +532,7 @@ fn transaction_custom_data(
         .unwrap_or(false);
     Ok((
         user_id.to_string(),
-        interval,
+        product,
         expected_amount,
         switching_from_monthly,
     ))
@@ -412,7 +542,7 @@ async fn verify_transaction(
     config: &AppConfig,
     transaction_id: &str,
     expected_user_id: Option<&str>,
-) -> Result<(PaddleTransaction, String, BillingInterval, i64), AppError> {
+) -> Result<(PaddleTransaction, String, PaddleProduct, i64, i64), AppError> {
     let transaction = fetch_transaction(config, transaction_id).await?;
     if transaction.id != transaction_id {
         return Err(AppError::BadRequest(
@@ -425,7 +555,7 @@ async fn verify_transaction(
         ));
     }
 
-    let (user_id, interval, expected_amount, switching_from_monthly) =
+    let (user_id, product, expected_amount, switching_from_monthly) =
         transaction_custom_data(&transaction)?;
     if expected_user_id.is_some_and(|expected| expected != user_id) {
         return Err(AppError::Forbidden(
@@ -438,16 +568,34 @@ async fn verify_transaction(
         ));
     }
 
-    let price_id = configured_price_id(config, interval)?;
-    let catalog_amount = expected_catalog_amount_minor(config, interval);
+    let (price_id, catalog_amount, amount_is_valid) = match product {
+        PaddleProduct::Lifetime => {
+            let price_id = configured_lifetime_price_id(config)?;
+            let catalog_amount = expected_lifetime_catalog_amount_minor(config);
+            (
+                price_id,
+                catalog_amount,
+                expected_amount > 0 && expected_amount <= catalog_amount,
+            )
+        }
+        PaddleProduct::Subscription(interval) => {
+            let price_id = configured_price_id(config, interval)?;
+            let catalog_amount = expected_catalog_amount_minor(config, interval);
+            (
+                price_id,
+                catalog_amount,
+                expected_amount > 0
+                    && (expected_amount == catalog_amount
+                        || (interval == BillingInterval::Year
+                            && switching_from_monthly
+                            && expected_amount < catalog_amount)),
+            )
+        }
+    };
     if transaction.items.len() != 1
         || transaction.items[0].price_id() != Some(price_id)
         || transaction.items[0].quantity != 1
-        || expected_amount <= 0
-        || (expected_amount != catalog_amount
-            && !(interval == BillingInterval::Year
-                && switching_from_monthly
-                && expected_amount < catalog_amount))
+        || !amount_is_valid
     {
         return Err(AppError::BadRequest(
             "Paddle transaction plan, amount, or currency is invalid.".to_string(),
@@ -457,7 +605,13 @@ async fn verify_transaction(
     let paid =
         validate_transaction_amounts(&transaction.details.totals, catalog_amount, expected_amount)?;
 
-    Ok((transaction, user_id, interval, paid))
+    Ok((
+        transaction,
+        user_id,
+        product,
+        paid,
+        catalog_amount.saturating_sub(expected_amount),
+    ))
 }
 
 pub async fn complete_transaction(
@@ -466,28 +620,48 @@ pub async fn complete_transaction(
     transaction_id: &str,
     expected_user_id: Option<&str>,
 ) -> Result<PaddleCompletion, AppError> {
-    let (transaction, user_id, interval, amount_minor) =
+    let (transaction, user_id, product, amount_minor, credit_minor) =
         verify_transaction(config, transaction_id, expected_user_id).await?;
-    let activated = activate_pro_subscription(
-        db,
-        &user_id,
-        interval,
-        &format!("paddle_{transaction_id}"),
-        transaction_id,
-        transaction_id,
-        amount_minor,
-        "USD",
-    )
-    .await?;
+    let (interval, expires_at) = match product {
+        PaddleProduct::Lifetime => {
+            let activated = super::activate_lifetime_purchase(
+                db,
+                &user_id,
+                "paddle",
+                transaction_id,
+                transaction_id,
+                amount_minor,
+                credit_minor,
+                "USD",
+            )
+            .await?;
+            ("lifetime".to_string(), activated.expires_at)
+        }
+        PaddleProduct::Subscription(interval) => {
+            let activated = activate_pro_subscription(
+                db,
+                &user_id,
+                interval,
+                &format!("paddle_{transaction_id}"),
+                transaction_id,
+                transaction_id,
+                amount_minor,
+                "USD",
+            )
+            .await?;
+            (
+                activated.interval.as_str().to_string(),
+                activated.expires_at,
+            )
+        }
+    };
 
     Ok(PaddleCompletion {
         success: true,
         status: transaction.status,
         plan: "pro".to_string(),
-        interval: activated.interval.as_str().to_string(),
-        expires_at: activated
-            .expires_at
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        interval,
+        expires_at: expires_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     })
 }
 
