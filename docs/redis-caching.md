@@ -25,6 +25,8 @@ response-cached. In particular, public responses retain their existing
 
 ## Local Compose
 
-Compose defaults to its local Redis service. To use a different Redis instance,
-set `REDIS_URL` in the local environment; Compose passes it through to the
-backend. For hosted Redis, use a TLS URL (`rediss://`) and a rotated credential.
+Compose always connects the backend to its local Redis service at
+`redis://redis:6379`, even if `REDIS_URL` is set in the host environment or
+`.env` file. When running the backend outside Compose, set `REDIS_URL` directly
+to select a Redis instance. For hosted Redis, use a TLS URL (`rediss://`) and a
+rotated credential.
