@@ -35,7 +35,6 @@ const MAX_BATCH_ELEMENTS: usize = 500;
 const MAX_SELECTION_SIZE: usize = 100;
 const ROOM_CAPACITY: usize = 256;
 const MAX_MESSAGES_PER_SECOND: usize = 60;
-const SNAPSHOT_CACHE_TTL_SECONDS: u64 = 60 * 60;
 
 // Version the JSON protocol and shared Redis channel independently of the HTTP API.
 const PROTOCOL_VERSION: u64 = 1;
@@ -393,101 +392,22 @@ pub async fn snapshot(
     authz::require_board_role(&state.db, &board_id, &user.id, BoardRole::Viewer).await?;
     let authorization_ms = authorization_started.elapsed().as_secs_f64() * 1000.0;
 
-    let revision_lookup_started = Instant::now();
-    let revision = sqlx::query_scalar::<_, i64>(
-        "SELECT revision FROM board_collaboration_state WHERE board_id = $1",
-    )
-    .bind(&board_id)
-    .fetch_optional(&state.db)
-    .await?;
-    let revision_lookup_ms = revision_lookup_started.elapsed().as_secs_f64() * 1000.0;
-
-    let mut snapshot_cache_read_ms = 0.0;
-    let mut snapshot_cache_hit = false;
-    let mut cached_snapshot = None;
-    if let Some(revision) = revision {
-        let cache_key = snapshot_cache_key(&board_id, revision);
-        let cache_read_started = Instant::now();
-        match state.cache.get_json::<SnapshotResponse>(&cache_key).await {
-            Ok(Some(snapshot))
-                if snapshot.board_id == board_id && snapshot.revision == revision =>
-            {
-                cached_snapshot = Some(snapshot);
-            }
-            Ok(Some(_)) => tracing::warn!(
-                subsystem = "cache",
-                event = "redis_cache_value_mismatch",
-                cache = "board_snapshot",
-                "Ignoring snapshot cache entry with mismatched revision"
-            ),
-            Ok(None) => {}
-            Err(error) => tracing::warn!(
-                subsystem = "cache",
-                event = "redis_cache_read_failed",
-                cache = "board_snapshot",
-                %error,
-                "Falling back to PostgreSQL for board snapshot"
-            ),
-        }
-        snapshot_cache_read_ms = cache_read_started.elapsed().as_secs_f64() * 1000.0;
-    }
-
-    let mut snapshot_load_ms = 0.0;
-    let mut snapshot_cache_write_ms = 0.0;
-    let result = if let Some(snapshot) = cached_snapshot {
-        snapshot_cache_hit = true;
-        snapshot
-    } else {
-        let snapshot_load_started = Instant::now();
-        let result = load_snapshot(&state, &board_id).await?;
-        snapshot_load_ms = snapshot_load_started.elapsed().as_secs_f64() * 1000.0;
-
-        let cache_key = snapshot_cache_key(&board_id, result.revision);
-        let cache_write_started = Instant::now();
-        if let Err(error) = state
-            .cache
-            .set_json(
-                &cache_key,
-                &result,
-                Duration::from_secs(SNAPSHOT_CACHE_TTL_SECONDS),
-            )
-            .await
-        {
-            tracing::warn!(
-                subsystem = "cache",
-                event = "redis_cache_write_failed",
-                cache = "board_snapshot",
-                %error,
-                "Board snapshot was not cached"
-            );
-        }
-        snapshot_cache_write_ms = cache_write_started.elapsed().as_secs_f64() * 1000.0;
-        result
-    };
+    let snapshot_load_started = Instant::now();
+    let result = load_snapshot(&state, &board_id).await?;
+    let snapshot_load_ms = snapshot_load_started.elapsed().as_secs_f64() * 1000.0;
 
     tracing::info!(
         subsystem = "collaboration",
         event = "snapshot_timing",
         auth_ms,
         authorization_ms,
-        revision_lookup_ms,
-        snapshot_cache_read_ms,
-        snapshot_cache_hit,
         snapshot_load_ms,
-        snapshot_cache_write_ms,
         element_count = result.elements.len(),
         total_ms = total_started.elapsed().as_secs_f64() * 1000.0,
         "Snapshot stage timings"
     );
 
     Ok(Json(result))
-}
-
-fn snapshot_cache_key(board_id: &str, revision: i64) -> String {
-    format!(
-        "sketchflow:api-cache:v1:{}:board-snapshot:{board_id}:{revision}",
-        crate::request_logging::app_environment()
-    )
 }
 
 /// Opens an authenticated, board-scoped WebSocket for document operations and presence.
