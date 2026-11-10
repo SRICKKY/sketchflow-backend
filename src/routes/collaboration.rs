@@ -383,23 +383,36 @@ pub async fn snapshot(
     Path(board_id): Path<String>,
     cookies: Cookies,
 ) -> AppResult<Json<SnapshotResponse>> {
+    let total_started = Instant::now();
+    let auth_started = Instant::now();
     // Viewer permission is enough to read a document, but never to submit edits.
     let user = session::require_current_user(&cookies, &state).await?;
-    authz::require_board_role(&state.db, &board_id, &user.id, BoardRole::Viewer).await?;
+    let auth_ms = auth_started.elapsed().as_secs_f64() * 1000.0;
 
+    let authorization_started = Instant::now();
+    authz::require_board_role(&state.db, &board_id, &user.id, BoardRole::Viewer).await?;
+    let authorization_ms = authorization_started.elapsed().as_secs_f64() * 1000.0;
+
+    let revision_lookup_started = Instant::now();
     let revision = sqlx::query_scalar::<_, i64>(
         "SELECT revision FROM board_collaboration_state WHERE board_id = $1",
     )
     .bind(&board_id)
     .fetch_optional(&state.db)
     .await?;
+    let revision_lookup_ms = revision_lookup_started.elapsed().as_secs_f64() * 1000.0;
+
+    let mut snapshot_cache_read_ms = 0.0;
+    let mut snapshot_cache_hit = false;
+    let mut cached_snapshot = None;
     if let Some(revision) = revision {
         let cache_key = snapshot_cache_key(&board_id, revision);
+        let cache_read_started = Instant::now();
         match state.cache.get_json::<SnapshotResponse>(&cache_key).await {
             Ok(Some(snapshot))
                 if snapshot.board_id == board_id && snapshot.revision == revision =>
             {
-                return Ok(Json(snapshot));
+                cached_snapshot = Some(snapshot);
             }
             Ok(Some(_)) => tracing::warn!(
                 subsystem = "cache",
@@ -416,27 +429,57 @@ pub async fn snapshot(
                 "Falling back to PostgreSQL for board snapshot"
             ),
         }
+        snapshot_cache_read_ms = cache_read_started.elapsed().as_secs_f64() * 1000.0;
     }
 
-    let result = load_snapshot(&state, &board_id).await?;
-    let cache_key = snapshot_cache_key(&board_id, result.revision);
-    if let Err(error) = state
-        .cache
-        .set_json(
-            &cache_key,
-            &result,
-            Duration::from_secs(SNAPSHOT_CACHE_TTL_SECONDS),
-        )
-        .await
-    {
-        tracing::warn!(
-            subsystem = "cache",
-            event = "redis_cache_write_failed",
-            cache = "board_snapshot",
-            %error,
-            "Board snapshot was not cached"
-        );
-    }
+    let mut snapshot_load_ms = 0.0;
+    let mut snapshot_cache_write_ms = 0.0;
+    let result = if let Some(snapshot) = cached_snapshot {
+        snapshot_cache_hit = true;
+        snapshot
+    } else {
+        let snapshot_load_started = Instant::now();
+        let result = load_snapshot(&state, &board_id).await?;
+        snapshot_load_ms = snapshot_load_started.elapsed().as_secs_f64() * 1000.0;
+
+        let cache_key = snapshot_cache_key(&board_id, result.revision);
+        let cache_write_started = Instant::now();
+        if let Err(error) = state
+            .cache
+            .set_json(
+                &cache_key,
+                &result,
+                Duration::from_secs(SNAPSHOT_CACHE_TTL_SECONDS),
+            )
+            .await
+        {
+            tracing::warn!(
+                subsystem = "cache",
+                event = "redis_cache_write_failed",
+                cache = "board_snapshot",
+                %error,
+                "Board snapshot was not cached"
+            );
+        }
+        snapshot_cache_write_ms = cache_write_started.elapsed().as_secs_f64() * 1000.0;
+        result
+    };
+
+    tracing::info!(
+        subsystem = "collaboration",
+        event = "snapshot_timing",
+        auth_ms,
+        authorization_ms,
+        revision_lookup_ms,
+        snapshot_cache_read_ms,
+        snapshot_cache_hit,
+        snapshot_load_ms,
+        snapshot_cache_write_ms,
+        element_count = result.elements.len(),
+        total_ms = total_started.elapsed().as_secs_f64() * 1000.0,
+        "Snapshot stage timings"
+    );
+
     Ok(Json(result))
 }
 
