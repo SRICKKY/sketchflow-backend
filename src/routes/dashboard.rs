@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -476,13 +478,21 @@ async fn dashboard(
     State(state): State<AppState>,
     cookies: Cookies,
 ) -> AppResult<Json<DashboardResponse>> {
+    let total_started = Instant::now();
+    let auth_started = Instant::now();
     let user = session::require_current_user(&cookies, &state).await?;
+    let auth_ms = auth_started.elapsed().as_secs_f64() * 1000.0;
+
+    let billing_started = Instant::now();
     let pro = is_pro(&state.db, &user.id).await?;
+    let billing_ms = billing_started.elapsed().as_secs_f64() * 1000.0;
+
     let counts_key = format!(
         "sketchflow:api-cache:v1:{}:dashboard-counts:{}",
         crate::request_logging::app_environment(),
         user.id
     );
+    let cache_read_started = Instant::now();
     let cached_counts = match state
         .cache
         .get_json::<CachedDashboardCounts>(&counts_key)
@@ -500,9 +510,14 @@ async fn dashboard(
             None
         }
     };
+    let counts_cache_read_ms = cache_read_started.elapsed().as_secs_f64() * 1000.0;
+    let counts_cache_hit = cached_counts.is_some();
+    let mut counts_queries_ms = 0.0;
+    let mut counts_cache_write_ms = 0.0;
     let counts = if let Some(counts) = cached_counts {
         counts
     } else {
+        let counts_queries_started = Instant::now();
         let owned_boards: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM boards WHERE owner_id=$1 AND workspace_id IS NULL",
         )
@@ -524,11 +539,13 @@ async fn dashboard(
         .bind(pro)
         .fetch_one(&state.db)
         .await?;
+        counts_queries_ms = counts_queries_started.elapsed().as_secs_f64() * 1000.0;
         let counts = CachedDashboardCounts {
             owned_boards,
             favorites,
             trash,
         };
+        let counts_cache_write_started = Instant::now();
         if let Err(error) = state
             .cache
             .set_json(&counts_key, &counts, std::time::Duration::from_secs(5))
@@ -542,8 +559,28 @@ async fn dashboard(
                 "Dashboard counts were not cached"
             );
         }
+        counts_cache_write_ms = counts_cache_write_started.elapsed().as_secs_f64() * 1000.0;
         counts
     };
+    let workspace_list_started = Instant::now();
+    let workspaces = workspace_list(&state.db, &user.id, pro).await?;
+    let workspace_list_ms = workspace_list_started.elapsed().as_secs_f64() * 1000.0;
+
+    tracing::info!(
+        subsystem = "dashboard",
+        event = "dashboard_timing",
+        auth_ms,
+        billing_ms,
+        counts_cache_read_ms,
+        counts_cache_hit,
+        counts_queries_ms,
+        counts_cache_write_ms,
+        workspace_list_ms,
+        total_ms = total_started.elapsed().as_secs_f64() * 1000.0,
+        is_pro = pro,
+        "Dashboard stage timings"
+    );
+
     Ok(Json(DashboardResponse {
         capabilities: Capabilities {
             is_pro: pro,
@@ -556,7 +593,7 @@ async fn dashboard(
             can_create_board: pro || counts.owned_boards < FREE_MAX_OWNED_BOARDS,
             can_save_templates: pro,
         },
-        workspaces: workspace_list(&state.db, &user.id, pro).await?,
+        workspaces,
         counts: DashboardCounts {
             favorites: counts.favorites,
             trash: counts.trash,
