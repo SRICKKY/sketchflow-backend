@@ -130,13 +130,6 @@ struct DashboardCounts {
     trash: i64,
 }
 
-#[derive(Deserialize, Serialize)]
-struct CachedDashboardCounts {
-    owned_boards: i64,
-    favorites: i64,
-    trash: i64,
-}
-
 #[derive(Debug, Serialize, FromRow)]
 #[serde(rename_all = "camelCase")]
 struct PrivateCollectionSummary {
@@ -487,81 +480,29 @@ async fn dashboard(
     let pro = is_pro(&state.db, &user.id).await?;
     let billing_ms = billing_started.elapsed().as_secs_f64() * 1000.0;
 
-    let counts_key = format!(
-        "sketchflow:api-cache:v1:{}:dashboard-counts:{}",
-        crate::request_logging::app_environment(),
-        user.id
-    );
-    let cache_read_started = Instant::now();
-    let cached_counts = match state
-        .cache
-        .get_json::<CachedDashboardCounts>(&counts_key)
-        .await
-    {
-        Ok(cached) => cached,
-        Err(error) => {
-            tracing::warn!(
-                subsystem = "cache",
-                event = "redis_cache_read_failed",
-                cache = "dashboard_counts",
-                %error,
-                "Falling back to PostgreSQL for dashboard counts"
-            );
-            None
-        }
-    };
-    let counts_cache_read_ms = cache_read_started.elapsed().as_secs_f64() * 1000.0;
-    let counts_cache_hit = cached_counts.is_some();
-    let mut counts_queries_ms = 0.0;
-    let mut counts_cache_write_ms = 0.0;
-    let counts = if let Some(counts) = cached_counts {
-        counts
-    } else {
-        let counts_queries_started = Instant::now();
-        let owned_boards: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM boards WHERE owner_id=$1 AND workspace_id IS NULL",
-        )
-        .bind(&user.id)
-        .fetch_one(&state.db)
-        .await?;
-        let (favorites, trash): (i64, i64) = sqlx::query_as(
-            "SELECT
-                (SELECT count(DISTINCT b.id)
-                 FROM board_favorites favorite
-                 JOIN boards b ON b.id=favorite.board_id
-                 LEFT JOIN board_members m ON m.board_id=b.id AND m.user_id=$1
-                 LEFT JOIN workspace_members wm ON wm.workspace_id=b.workspace_id AND wm.user_id=$1
-                 WHERE favorite.user_id=$1 AND b.deleted_at IS NULL
-                   AND (b.owner_id=$1 OR m.id IS NOT NULL OR ($2::boolean AND wm.user_id=$1))),
-                (SELECT count(*) FROM boards b WHERE b.owner_id=$1 AND b.deleted_at IS NOT NULL)",
-        )
-        .bind(&user.id)
-        .bind(pro)
-        .fetch_one(&state.db)
-        .await?;
-        counts_queries_ms = counts_queries_started.elapsed().as_secs_f64() * 1000.0;
-        let counts = CachedDashboardCounts {
-            owned_boards,
-            favorites,
-            trash,
-        };
-        let counts_cache_write_started = Instant::now();
-        if let Err(error) = state
-            .cache
-            .set_json(&counts_key, &counts, std::time::Duration::from_secs(5))
-            .await
-        {
-            tracing::warn!(
-                subsystem = "cache",
-                event = "redis_cache_write_failed",
-                cache = "dashboard_counts",
-                %error,
-                "Dashboard counts were not cached"
-            );
-        }
-        counts_cache_write_ms = counts_cache_write_started.elapsed().as_secs_f64() * 1000.0;
-        counts
-    };
+    let counts_queries_started = Instant::now();
+    let owned_boards: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM boards WHERE owner_id=$1 AND workspace_id IS NULL",
+    )
+    .bind(&user.id)
+    .fetch_one(&state.db)
+    .await?;
+    let (favorites, trash): (i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT count(DISTINCT b.id)
+             FROM board_favorites favorite
+             JOIN boards b ON b.id=favorite.board_id
+             LEFT JOIN board_members m ON m.board_id=b.id AND m.user_id=$1
+             LEFT JOIN workspace_members wm ON wm.workspace_id=b.workspace_id AND wm.user_id=$1
+             WHERE favorite.user_id=$1 AND b.deleted_at IS NULL
+               AND (b.owner_id=$1 OR m.id IS NOT NULL OR ($2::boolean AND wm.user_id=$1))),
+            (SELECT count(*) FROM boards b WHERE b.owner_id=$1 AND b.deleted_at IS NOT NULL)",
+    )
+    .bind(&user.id)
+    .bind(pro)
+    .fetch_one(&state.db)
+    .await?;
+    let counts_queries_ms = counts_queries_started.elapsed().as_secs_f64() * 1000.0;
     let workspace_list_started = Instant::now();
     let workspaces = workspace_list(&state.db, &user.id, pro).await?;
     let workspace_list_ms = workspace_list_started.elapsed().as_secs_f64() * 1000.0;
@@ -571,10 +512,7 @@ async fn dashboard(
         event = "dashboard_timing",
         auth_ms,
         billing_ms,
-        counts_cache_read_ms,
-        counts_cache_hit,
         counts_queries_ms,
-        counts_cache_write_ms,
         workspace_list_ms,
         total_ms = total_started.elapsed().as_secs_f64() * 1000.0,
         is_pro = pro,
@@ -584,20 +522,17 @@ async fn dashboard(
     Ok(Json(DashboardResponse {
         capabilities: Capabilities {
             is_pro: pro,
-            owned_boards: counts.owned_boards,
+            owned_boards,
             max_owned_boards: if pro {
                 None
             } else {
                 Some(FREE_MAX_OWNED_BOARDS)
             },
-            can_create_board: pro || counts.owned_boards < FREE_MAX_OWNED_BOARDS,
+            can_create_board: pro || owned_boards < FREE_MAX_OWNED_BOARDS,
             can_save_templates: pro,
         },
         workspaces,
-        counts: DashboardCounts {
-            favorites: counts.favorites,
-            trash: counts.trash,
-        },
+        counts: DashboardCounts { favorites, trash },
     }))
 }
 
