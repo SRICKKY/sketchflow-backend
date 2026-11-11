@@ -766,7 +766,7 @@ async fn list_boards(
     if let Some(cache_key) = cache_key {
         if let Err(error) = state
             .cache
-            .set_json(&cache_key, &page, std::time::Duration::from_secs(5))
+            .set_json(&cache_key, &page, std::time::Duration::from_secs(60 * 60))
             .await
         {
             tracing::warn!(
