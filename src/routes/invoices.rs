@@ -2,7 +2,8 @@ use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tower_cookies::Cookies;
 use utoipa::ToSchema;
 
@@ -15,7 +16,7 @@ use crate::{
     state::AppState,
 };
 
-#[derive(Serialize, ToSchema)]
+#[derive(Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InvoiceResponse {
     pub id: String,
@@ -66,10 +67,39 @@ pub async fn list_invoices(
     let user = session::optional_current_user(&cookies, &state)
         .await?
         .ok_or_else(|| AppError::Unauthorized("Sign in to view invoices.".to_string()))?;
+    let cache_key = crate::routes::billing::invoice_list_cache_key(&user.id);
+    match state
+        .cache
+        .get_json::<Vec<InvoiceResponse>>(&cache_key)
+        .await
+    {
+        Ok(Some(invoices)) => return Ok(Json(invoices)),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            subsystem = "cache",
+            event = "redis_cache_read_failed",
+            cache = "billing_invoices",
+            %error,
+            "Loading invoices from PostgreSQL"
+        ),
+    }
+
     let invoices = list_invoices_for_user(&state.db, &state.config, &user.id).await?;
-    Ok(Json(
-        invoices.into_iter().map(InvoiceResponse::from).collect(),
-    ))
+    let response: Vec<InvoiceResponse> = invoices.into_iter().map(InvoiceResponse::from).collect();
+    if let Err(error) = state
+        .cache
+        .set_json(&cache_key, &response, Duration::from_secs(5 * 60 * 60))
+        .await
+    {
+        tracing::warn!(
+            subsystem = "cache",
+            event = "redis_cache_write_failed",
+            cache = "billing_invoices",
+            %error,
+            "Invoice list response was not cached"
+        );
+    }
+    Ok(Json(response))
 }
 
 /// Download a paid invoice as a PDF. Mirrors

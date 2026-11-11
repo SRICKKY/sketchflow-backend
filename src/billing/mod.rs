@@ -912,6 +912,18 @@ pub async fn list_invoices_for_user(
     Ok(invoices)
 }
 
+pub async fn user_id_for_gateway_payment(
+    db: &PgPool,
+    gateway_payment_id: &str,
+) -> Result<Option<String>, AppError> {
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT user_id FROM invoices WHERE gateway_payment_id = $1 LIMIT 1",
+    )
+    .bind(gateway_payment_id)
+    .fetch_optional(db)
+    .await?)
+}
+
 /// Fetch an invoice by id, scoped to the requesting user. Mirrors
 /// `getInvoiceForUser` from `server/billing.ts`.
 pub async fn get_invoice_for_user(

@@ -35,6 +35,7 @@ const MAX_BATCH_ELEMENTS: usize = 500;
 const MAX_SELECTION_SIZE: usize = 100;
 const ROOM_CAPACITY: usize = 256;
 const MAX_MESSAGES_PER_SECOND: usize = 60;
+const SNAPSHOT_CACHE_TTL_SECONDS: u64 = 5 * 60 * 60;
 
 // Version the JSON protocol and shared Redis channel independently of the HTTP API.
 const PROTOCOL_VERSION: u64 = 1;
@@ -60,8 +61,16 @@ const ALLOWED_ELEMENT_TYPES: [&str; 11] = [
 pub struct CollaborationHub {
     // Local socket groups receive events from the current process.
     rooms: Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>,
+    // Recent presence events let newly joined sockets initialize their collaborator list.
+    presence: Arc<Mutex<HashMap<String, HashMap<String, ActivePresence>>>>,
     // Shared publisher is present only when Redis fan-out is configured.
     redis_publisher: Option<ConnectionManager>,
+}
+
+#[derive(Clone)]
+struct ActivePresence {
+    joined: String,
+    updated: Option<String>,
 }
 
 // Redis envelopes carry the board routing key separately from the client protocol event.
@@ -82,6 +91,7 @@ impl CollaborationHub {
 
         let hub = Self {
             rooms: Arc::new(Mutex::new(HashMap::new())),
+            presence: Arc::new(Mutex::new(HashMap::new())),
             redis_publisher: Some(publisher),
         };
         tokio::spawn(run_redis_subscriber(client, subscriber, hub.clone()));
@@ -116,6 +126,7 @@ impl CollaborationHub {
         let mut rooms = self.rooms.lock().await;
         if sender.receiver_count() == 0 {
             rooms.remove(board_id);
+            self.presence.lock().await.remove(board_id);
         }
     }
 
@@ -135,9 +146,91 @@ impl CollaborationHub {
 
     /// Sends a received Redis event only to sockets connected to this board on this instance.
     async fn publish_local(&self, board_id: &str, message: String) {
-        if let Some(sender) = self.rooms.lock().await.get(board_id).cloned() {
+        let sender = self.rooms.lock().await.get(board_id).cloned();
+        if let Some(sender) = sender {
+            self.record_presence(board_id, &message).await;
             let _ = sender.send(message);
         }
+    }
+
+    async fn record_presence(&self, board_id: &str, message: &str) {
+        let event: Value = match serde_json::from_str(message) {
+            Ok(event) => event,
+            Err(error) => {
+                tracing::warn!(
+                    subsystem = "websocket",
+                    event = "presence_registry_update_failed",
+                    board_id,
+                    %error,
+                    "Could not decode collaboration event for presence registry"
+                );
+                return;
+            }
+        };
+        let Some(event_type) = event.get("type").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(connection_id) = event.get("connectionId").and_then(Value::as_str) else {
+            return;
+        };
+
+        let mut presence = self.presence.lock().await;
+        match event_type {
+            "presence_joined" => {
+                presence.entry(board_id.to_string()).or_default().insert(
+                    connection_id.to_string(),
+                    ActivePresence {
+                        joined: message.to_string(),
+                        updated: None,
+                    },
+                );
+            }
+            "presence_updated" => {
+                let joined = serde_json::to_string(&json!({
+                    "type": "presence_joined",
+                    "protocolVersion": event.get("protocolVersion"),
+                    "connectionId": connection_id,
+                    "userId": event.get("userId"),
+                    "name": event.get("name"),
+                    "image": event.get("image"),
+                }))
+                .expect("presence registry event is serializable");
+                let board_presence = presence.entry(board_id.to_string()).or_default();
+                let participant = board_presence
+                    .entry(connection_id.to_string())
+                    .or_insert_with(|| ActivePresence {
+                        joined,
+                        updated: None,
+                    });
+                participant.updated = Some(message.to_string());
+            }
+            "presence_left" => {
+                if let Some(board_presence) = presence.get_mut(board_id) {
+                    board_presence.remove(connection_id);
+                    if board_presence.is_empty() {
+                        presence.remove(board_id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn presence_snapshot(&self, board_id: &str) -> Vec<String> {
+        self.presence
+            .lock()
+            .await
+            .get(board_id)
+            .map(|participants| {
+                participants
+                    .values()
+                    .flat_map(|participant| {
+                        std::iter::once(participant.joined.clone())
+                            .chain(participant.updated.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Notifies connected clients on every instance that a user's board access was revoked.
@@ -331,6 +424,8 @@ enum ServerMessage {
     PresenceUpdated {
         connection_id: String,
         user_id: String,
+        name: Option<String>,
+        image: Option<String>,
         cursor: Option<Point>,
         selected_ids: Vec<String>,
     },
@@ -392,22 +487,101 @@ pub async fn snapshot(
     authz::require_board_role(&state.db, &board_id, &user.id, BoardRole::Viewer).await?;
     let authorization_ms = authorization_started.elapsed().as_secs_f64() * 1000.0;
 
-    let snapshot_load_started = Instant::now();
-    let result = load_snapshot(&state, &board_id).await?;
-    let snapshot_load_ms = snapshot_load_started.elapsed().as_secs_f64() * 1000.0;
+    let revision_lookup_started = Instant::now();
+    let revision = sqlx::query_scalar::<_, i64>(
+        "SELECT revision FROM board_collaboration_state WHERE board_id = $1",
+    )
+    .bind(&board_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let revision_lookup_ms = revision_lookup_started.elapsed().as_secs_f64() * 1000.0;
+
+    let mut snapshot_cache_read_ms = 0.0;
+    let mut snapshot_cache_hit = false;
+    let mut cached_snapshot = None;
+    if let Some(revision) = revision {
+        let cache_key = snapshot_cache_key(&board_id, revision);
+        let cache_read_started = Instant::now();
+        match state.cache.get_json::<SnapshotResponse>(&cache_key).await {
+            Ok(Some(snapshot))
+                if snapshot.board_id == board_id && snapshot.revision == revision =>
+            {
+                cached_snapshot = Some(snapshot);
+            }
+            Ok(Some(_)) => tracing::warn!(
+                subsystem = "cache",
+                event = "redis_cache_value_mismatch",
+                cache = "board_snapshot",
+                "Ignoring snapshot cache entry with mismatched revision"
+            ),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                subsystem = "cache",
+                event = "redis_cache_read_failed",
+                cache = "board_snapshot",
+                %error,
+                "Falling back to PostgreSQL for board snapshot"
+            ),
+        }
+        snapshot_cache_read_ms = cache_read_started.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    let mut snapshot_load_ms = 0.0;
+    let mut snapshot_cache_write_ms = 0.0;
+    let result = if let Some(snapshot) = cached_snapshot {
+        snapshot_cache_hit = true;
+        snapshot
+    } else {
+        let snapshot_load_started = Instant::now();
+        let result = load_snapshot(&state, &board_id).await?;
+        snapshot_load_ms = snapshot_load_started.elapsed().as_secs_f64() * 1000.0;
+
+        let cache_key = snapshot_cache_key(&board_id, result.revision);
+        let cache_write_started = Instant::now();
+        if let Err(error) = state
+            .cache
+            .set_json(
+                &cache_key,
+                &result,
+                Duration::from_secs(SNAPSHOT_CACHE_TTL_SECONDS),
+            )
+            .await
+        {
+            tracing::warn!(
+                subsystem = "cache",
+                event = "redis_cache_write_failed",
+                cache = "board_snapshot",
+                %error,
+                "Board snapshot was not cached"
+            );
+        }
+        snapshot_cache_write_ms = cache_write_started.elapsed().as_secs_f64() * 1000.0;
+        result
+    };
 
     tracing::info!(
         subsystem = "collaboration",
         event = "snapshot_timing",
         auth_ms,
         authorization_ms,
+        revision_lookup_ms,
+        snapshot_cache_read_ms,
+        snapshot_cache_hit,
         snapshot_load_ms,
+        snapshot_cache_write_ms,
         element_count = result.elements.len(),
         total_ms = total_started.elapsed().as_secs_f64() * 1000.0,
         "Snapshot stage timings"
     );
 
     Ok(Json(result))
+}
+
+fn snapshot_cache_key(board_id: &str, revision: i64) -> String {
+    format!(
+        "sketchflow:api-cache:v1:{}:board-snapshot:{board_id}:{revision}",
+        crate::request_logging::app_environment()
+    )
 }
 
 /// Opens an authenticated, board-scoped WebSocket for document operations and presence.
@@ -477,6 +651,7 @@ async fn handle_socket(
 ) {
     let connection_started = Instant::now();
     let connection_id = cuid2::create_id();
+    let presence_name = display_presence_name(user.name.as_deref(), &user.email);
     tracing::Span::current().record("connection_id", tracing::field::display(&connection_id));
     tracing::info!(event = "connection_started", "WebSocket connection started");
     // Subscribe before reading the snapshot so updates arriving during sync are buffered.
@@ -538,6 +713,26 @@ async fn handle_socket(
         return;
     }
 
+    for presence_message in state.collaboration.presence_snapshot(&board_id).await {
+        if socket
+            .send(Message::Text(presence_message.into()))
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                event = "connection_failed",
+                reason = "presence_sync_failed",
+                "WebSocket presence synchronization failed"
+            );
+            drop(room_rx);
+            state
+                .collaboration
+                .remove_if_empty(&board_id, &room_tx)
+                .await;
+            return;
+        }
+    }
+
     publish_message(
         &state.collaboration,
         &board_id,
@@ -545,7 +740,7 @@ async fn handle_socket(
         &ServerMessage::PresenceJoined {
             connection_id: connection_id.clone(),
             user_id: user.id.clone(),
-            name: user.name.clone(),
+            name: Some(presence_name.clone()),
             image: user.image.clone(),
         },
     )
@@ -778,6 +973,8 @@ async fn handle_socket(
                                         &ServerMessage::PresenceUpdated {
                                             connection_id: connection_id.clone(),
                                             user_id: user.id.clone(),
+                                            name: Some(presence_name.clone()),
+                                            image: user.image.clone(),
                                             cursor,
                                             selected_ids,
                                         },
@@ -1002,6 +1199,20 @@ fn validate_presence(
     Ok((cursor, selected_ids))
 }
 
+fn display_presence_name(name: Option<&str>, email: &str) -> String {
+    name.map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            email
+                .split_once('@')
+                .map(|(username, _)| username.trim())
+                .filter(|username| !username.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "User".to_string())
+}
+
 /// Reads board elements with the revision that identifies their persisted state.
 async fn load_snapshot(state: &AppState, board_id: &str) -> AppResult<SnapshotResponse> {
     // Older boards may not yet have a collaboration revision row.
@@ -1114,6 +1325,7 @@ async fn publish_message(
     let json = serialize_server_message(message);
     if hub.redis_publisher.is_none() {
         // Without Redis, this process is the complete collaboration cluster.
+        hub.record_presence(board_id, &json).await;
         let _ = local_sender.send(json);
         return;
     }
@@ -1252,6 +1464,54 @@ mod tests {
             "Your permission to view this canvas has been revoked."
         );
         assert_eq!(envelope["protocolVersion"], PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn presence_name_falls_back_to_the_users_email_name() {
+        assert_eq!(
+            display_presence_name(Some("  Alice  "), "alice@example.com"),
+            "Alice"
+        );
+        assert_eq!(display_presence_name(None, "alice@example.com"), "alice");
+        assert_eq!(display_presence_name(Some(" "), "not-an-email"), "User");
+    }
+
+    #[tokio::test]
+    async fn presence_registry_replays_identity_and_latest_cursor() {
+        let hub = CollaborationHub::default();
+        let joined = serialize_server_message(&ServerMessage::PresenceJoined {
+            connection_id: "connection-1".to_string(),
+            user_id: "user-1".to_string(),
+            name: Some("Alice".to_string()),
+            image: Some("https://example.com/avatar.png".to_string()),
+        });
+        hub.record_presence("board-1", &joined).await;
+        let updated = serialize_server_message(&ServerMessage::PresenceUpdated {
+            connection_id: "connection-1".to_string(),
+            user_id: "user-1".to_string(),
+            name: Some("Alice".to_string()),
+            image: Some("https://example.com/avatar.png".to_string()),
+            cursor: Some(Point { x: 12.0, y: 34.0 }),
+            selected_ids: vec![],
+        });
+        hub.record_presence("board-1", &updated).await;
+
+        let snapshot = hub.presence_snapshot("board-1").await;
+        assert_eq!(snapshot.len(), 2);
+        let joined: Value = serde_json::from_str(&snapshot[0]).unwrap();
+        let updated: Value = serde_json::from_str(&snapshot[1]).unwrap();
+        assert_eq!(joined["type"], "presence_joined");
+        assert_eq!(joined["name"], "Alice");
+        assert_eq!(joined["image"], "https://example.com/avatar.png");
+        assert_eq!(updated["type"], "presence_updated");
+        assert_eq!(updated["cursor"]["x"], 12.0);
+
+        let left = serialize_server_message(&ServerMessage::PresenceLeft {
+            connection_id: "connection-1".to_string(),
+            user_id: "user-1".to_string(),
+        });
+        hub.record_presence("board-1", &left).await;
+        assert!(hub.presence_snapshot("board-1").await.is_empty());
     }
 
     #[tokio::test]
