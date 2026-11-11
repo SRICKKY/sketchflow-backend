@@ -35,7 +35,7 @@ const MAX_BATCH_ELEMENTS: usize = 500;
 const MAX_SELECTION_SIZE: usize = 100;
 const ROOM_CAPACITY: usize = 256;
 const MAX_MESSAGES_PER_SECOND: usize = 60;
-const SNAPSHOT_CACHE_TTL_SECONDS: u64 = 60 * 60;
+const SNAPSHOT_CACHE_TTL_SECONDS: u64 = 5 * 60 * 60;
 
 // Version the JSON protocol and shared Redis channel independently of the HTTP API.
 const PROTOCOL_VERSION: u64 = 1;

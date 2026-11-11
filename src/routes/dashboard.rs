@@ -222,7 +222,10 @@ fn dashboard_counts_cache_key(user_id: &str) -> String {
     )
 }
 
-async fn invalidate_dashboard_counts_cache(cache: &crate::cache::RedisCache, user_id: &str) {
+pub(crate) async fn invalidate_dashboard_counts_cache(
+    cache: &crate::cache::RedisCache,
+    user_id: &str,
+) {
     let cache_key = dashboard_counts_cache_key(user_id);
     if let Err(error) = cache.delete(&cache_key).await {
         tracing::warn!(

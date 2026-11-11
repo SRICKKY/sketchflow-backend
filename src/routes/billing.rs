@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{body::Bytes, extract::State, http::HeaderMap, Json};
 use chrono::Utc;
@@ -17,6 +17,62 @@ use crate::{
     extract::AppJson,
     state::AppState,
 };
+
+const BILLING_PAGE_CACHE_TTL_SECONDS: u64 = 5 * 60 * 60;
+
+pub(crate) fn billing_overview_cache_key(user_id: &str) -> String {
+    format!(
+        "sketchflow:api-cache:v1:{}:billing-overview:{user_id}",
+        crate::request_logging::app_environment()
+    )
+}
+
+pub(crate) fn invoice_list_cache_key(user_id: &str) -> String {
+    format!(
+        "sketchflow:api-cache:v1:{}:billing-invoices:{user_id}",
+        crate::request_logging::app_environment()
+    )
+}
+
+fn billing_overview_cache_ttl(
+    status: &str,
+    expires_at: Option<chrono::DateTime<Utc>>,
+) -> Option<Duration> {
+    let max_ttl = Duration::from_secs(BILLING_PAGE_CACHE_TTL_SECONDS);
+    if status != "active" {
+        return Some(max_ttl);
+    }
+
+    match expires_at {
+        Some(expires_at) => (expires_at - Utc::now())
+            .to_std()
+            .ok()
+            .filter(|ttl| !ttl.is_zero())
+            .map(|ttl| ttl.min(max_ttl)),
+        None => Some(max_ttl),
+    }
+}
+
+pub(crate) async fn invalidate_user_billing_caches(
+    cache: &crate::cache::RedisCache,
+    user_id: &str,
+) {
+    for (cache_name, key) in [
+        ("billing_overview", billing_overview_cache_key(user_id)),
+        ("billing_invoices", invoice_list_cache_key(user_id)),
+    ] {
+        if let Err(error) = cache.delete(&key).await {
+            tracing::warn!(
+                subsystem = "cache",
+                event = "redis_cache_invalidation_failed",
+                cache = cache_name,
+                %error,
+                "Billing cache will expire by TTL"
+            );
+        }
+    }
+    crate::routes::dashboard::invalidate_dashboard_counts_cache(cache, user_id).await;
+}
 
 struct PaymentAttempt {
     provider: String,
@@ -116,7 +172,7 @@ pub struct AnnualUpgradeQuoteResponse {
     pub currency: Option<String>,
 }
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BillingOverviewResponse {
     pub status: String,
@@ -157,6 +213,23 @@ pub async fn billing_overview(
     let user = session::optional_current_user(&cookies, &state)
         .await?
         .ok_or_else(|| AppError::Unauthorized("Sign in to view billing.".to_string()))?;
+    let cache_key = billing_overview_cache_key(&user.id);
+    match state
+        .cache
+        .get_json::<BillingOverviewResponse>(&cache_key)
+        .await
+    {
+        Ok(Some(response)) => return Ok(Json(response)),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            subsystem = "cache",
+            event = "redis_cache_read_failed",
+            cache = "billing_overview",
+            %error,
+            "Loading billing overview from PostgreSQL"
+        ),
+    }
+
     let billing = get_billing_state(&state.db, &user.id).await?;
     let status = match billing.status {
         BillingStatus::Free => "free",
@@ -164,14 +237,28 @@ pub async fn billing_overview(
         BillingStatus::Expired => "expired",
     };
 
-    Ok(Json(BillingOverviewResponse {
+    let cache_ttl = billing_overview_cache_ttl(status, billing.expires_at);
+    let response = BillingOverviewResponse {
         status: status.to_string(),
         plan: billing.plan.to_string(),
         interval: billing.interval.map(|value| value.as_str().to_string()),
         lifetime_pro: billing.lifetime_pro,
         starts_at: billing.starts_at.map(|value| value.to_rfc3339()),
         expires_at: billing.expires_at.map(|value| value.to_rfc3339()),
-    }))
+    };
+    if let Some(ttl) = cache_ttl {
+        if let Err(error) = state.cache.set_json(&cache_key, &response, ttl).await {
+            tracing::warn!(
+                subsystem = "cache",
+                event = "redis_cache_write_failed",
+                cache = "billing_overview",
+                %error,
+                "Billing overview response was not cached"
+            );
+        }
+    }
+
+    Ok(Json(response))
 }
 
 /// Return an exact quote for Lifetime Pro, including any unused paid-time credit.
@@ -611,6 +698,7 @@ pub async fn verify_paddle_payment(
         Some(&user.id),
     )
     .await?;
+    invalidate_user_billing_caches(&state.cache, &user.id).await;
     attempt.succeed();
     Ok(Json(completion))
 }
@@ -672,6 +760,7 @@ pub async fn paddle_webhook(
             })?;
         billing::paddle::complete_transaction(&state.db, &state.config, transaction_id, None)
             .await?;
+        invalidate_paddle_payment_caches(&state, transaction_id).await?;
     } else if matches!(
         event_type,
         Some("adjustment.created") | Some("adjustment.updated")
@@ -697,12 +786,27 @@ pub async fn paddle_webhook(
             };
             if let Some(revoke_status) = revoke_status {
                 billing::revoke_lifetime_purchase(&state.db, transaction_id, revoke_status).await?;
+                invalidate_paddle_payment_caches(&state, transaction_id).await?;
             }
         }
     }
 
     attempt.succeed();
     Ok(Json(PaddleWebhookResponse { received: true }))
+}
+
+async fn invalidate_paddle_payment_caches(state: &AppState, transaction_id: &str) -> AppResult<()> {
+    let user_id = billing::user_id_for_gateway_payment(&state.db, transaction_id).await?;
+    if let Some(user_id) = user_id {
+        invalidate_user_billing_caches(&state.cache, &user_id).await;
+    } else {
+        tracing::warn!(
+            subsystem = "cache",
+            event = "billing_cache_owner_not_found",
+            "Unable to identify Paddle transaction owner for cache invalidation"
+        );
+    }
+    Ok(())
 }
 
 /// Verify a Razorpay payment signature and activate the Pro subscription.
@@ -817,6 +921,7 @@ pub async fn verify_payment(
             &payment.currency,
         )
         .await?;
+        invalidate_user_billing_caches(&state.cache, &user.id).await;
         attempt.succeed();
         return Ok(Json(VerifyPaymentResponse {
             success: true,
@@ -843,6 +948,7 @@ pub async fn verify_payment(
     )
     .await?;
 
+    invalidate_user_billing_caches(&state.cache, &user.id).await;
     attempt.succeed();
     Ok(Json(VerifyPaymentResponse {
         success: true,
@@ -853,4 +959,37 @@ pub async fn verify_payment(
             .expires_at
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn billing_cache_keys_include_environment_and_user() {
+        let overview_key = billing_overview_cache_key("user-123");
+        let invoices_key = invoice_list_cache_key("user-123");
+
+        assert!(overview_key.contains(":billing-overview:user-123"));
+        assert!(invoices_key.contains(":billing-invoices:user-123"));
+        assert!(overview_key.contains(crate::request_logging::app_environment()));
+        assert!(invoices_key.contains(crate::request_logging::app_environment()));
+    }
+
+    #[test]
+    fn active_billing_cache_expires_no_later_than_the_subscription() {
+        let expires_at = Utc::now() + chrono::Duration::minutes(10);
+        let ttl = billing_overview_cache_ttl("active", Some(expires_at)).unwrap();
+
+        assert!(ttl <= Duration::from_secs(10 * 60));
+        assert!(!ttl.is_zero());
+    }
+
+    #[test]
+    fn non_active_billing_cache_uses_the_five_hour_ttl() {
+        assert_eq!(
+            billing_overview_cache_ttl("expired", None),
+            Some(Duration::from_secs(BILLING_PAGE_CACHE_TTL_SECONDS))
+        );
+    }
 }
