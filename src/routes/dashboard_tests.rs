@@ -72,6 +72,25 @@ fn owned_board_list_cache_is_user_scoped_and_serializable() {
 }
 
 #[test]
+fn dashboard_counts_cache_is_user_scoped_and_serializable() {
+    let user_a_key = dashboard_counts_cache_key("user-a");
+    let user_b_key = dashboard_counts_cache_key("user-b");
+    assert_ne!(user_a_key, user_b_key);
+
+    let counts = CachedDashboardCounts {
+        owned_boards: 3,
+        favorites: 4,
+        trash: 1,
+    };
+    let serialized = serde_json::to_string(&counts).unwrap();
+    let cached: CachedDashboardCounts = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(cached.owned_boards, counts.owned_boards);
+    assert_eq!(cached.favorites, counts.favorites);
+    assert_eq!(cached.trash, counts.trash);
+    assert_eq!(DASHBOARD_COUNTS_CACHE_TTL_SECONDS, 60 * 60);
+}
+
+#[test]
 fn actual_builtins_remint_ids_and_bindings() {
     let templates = builtin_templates();
     assert_eq!(templates.len(), 7);

@@ -25,6 +25,8 @@ use crate::{
     state::AppState,
 };
 
+const DASHBOARD_COUNTS_CACHE_TTL_SECONDS: u64 = 60 * 60;
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/dashboard", get(dashboard))
@@ -130,6 +132,13 @@ struct DashboardCounts {
     trash: i64,
 }
 
+#[derive(Deserialize, Serialize)]
+struct CachedDashboardCounts {
+    owned_boards: i64,
+    favorites: i64,
+    trash: i64,
+}
+
 #[derive(Debug, Serialize, FromRow)]
 #[serde(rename_all = "camelCase")]
 struct PrivateCollectionSummary {
@@ -206,6 +215,26 @@ fn owned_boards_first_page_cache_key(user_id: &str) -> String {
     )
 }
 
+fn dashboard_counts_cache_key(user_id: &str) -> String {
+    format!(
+        "sketchflow:api-cache:v1:{}:dashboard-counts:{user_id}",
+        crate::request_logging::app_environment()
+    )
+}
+
+async fn invalidate_dashboard_counts_cache(cache: &crate::cache::RedisCache, user_id: &str) {
+    let cache_key = dashboard_counts_cache_key(user_id);
+    if let Err(error) = cache.delete(&cache_key).await {
+        tracing::warn!(
+            subsystem = "cache",
+            event = "redis_cache_invalidation_failed",
+            cache = "dashboard_counts",
+            %error,
+            "Dashboard counts cache will expire by TTL"
+        );
+    }
+}
+
 async fn invalidate_owned_boards_first_page_cache(cache: &crate::cache::RedisCache, user_id: &str) {
     let cache_key = owned_boards_first_page_cache_key(user_id);
     if let Err(error) = cache.delete(&cache_key).await {
@@ -217,6 +246,7 @@ async fn invalidate_owned_boards_first_page_cache(cache: &crate::cache::RedisCac
             "Owned-board list cache will expire by TTL"
         );
     }
+    invalidate_dashboard_counts_cache(cache, user_id).await;
 }
 
 #[derive(Deserialize, Serialize)]
@@ -480,29 +510,81 @@ async fn dashboard(
     let pro = is_pro(&state.db, &user.id).await?;
     let billing_ms = billing_started.elapsed().as_secs_f64() * 1000.0;
 
-    let counts_queries_started = Instant::now();
-    let owned_boards: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM boards WHERE owner_id=$1 AND workspace_id IS NULL",
-    )
-    .bind(&user.id)
-    .fetch_one(&state.db)
-    .await?;
-    let (favorites, trash): (i64, i64) = sqlx::query_as(
-        "SELECT
-            (SELECT count(DISTINCT b.id)
-             FROM board_favorites favorite
-             JOIN boards b ON b.id=favorite.board_id
-             LEFT JOIN board_members m ON m.board_id=b.id AND m.user_id=$1
-             LEFT JOIN workspace_members wm ON wm.workspace_id=b.workspace_id AND wm.user_id=$1
-             WHERE favorite.user_id=$1 AND b.deleted_at IS NULL
-               AND (b.owner_id=$1 OR m.id IS NOT NULL OR ($2::boolean AND wm.user_id=$1))),
-            (SELECT count(*) FROM boards b WHERE b.owner_id=$1 AND b.deleted_at IS NOT NULL)",
-    )
-    .bind(&user.id)
-    .bind(pro)
-    .fetch_one(&state.db)
-    .await?;
-    let counts_queries_ms = counts_queries_started.elapsed().as_secs_f64() * 1000.0;
+    let counts_key = dashboard_counts_cache_key(&user.id);
+    let cache_read_started = Instant::now();
+    let cached_counts = match state
+        .cache
+        .get_json::<CachedDashboardCounts>(&counts_key)
+        .await
+    {
+        Ok(cached) => cached,
+        Err(error) => {
+            tracing::warn!(
+                subsystem = "cache",
+                event = "redis_cache_read_failed",
+                cache = "dashboard_counts",
+                %error,
+                "Falling back to PostgreSQL for dashboard counts"
+            );
+            None
+        }
+    };
+    let counts_cache_read_ms = cache_read_started.elapsed().as_secs_f64() * 1000.0;
+    let counts_cache_hit = cached_counts.is_some();
+    let mut counts_queries_ms = 0.0;
+    let mut counts_cache_write_ms = 0.0;
+    let counts = if let Some(counts) = cached_counts {
+        counts
+    } else {
+        let counts_queries_started = Instant::now();
+        let owned_boards: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM boards WHERE owner_id=$1 AND workspace_id IS NULL",
+        )
+        .bind(&user.id)
+        .fetch_one(&state.db)
+        .await?;
+        let (favorites, trash): (i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT count(DISTINCT b.id)
+                 FROM board_favorites favorite
+                 JOIN boards b ON b.id=favorite.board_id
+                 LEFT JOIN board_members m ON m.board_id=b.id AND m.user_id=$1
+                 LEFT JOIN workspace_members wm ON wm.workspace_id=b.workspace_id AND wm.user_id=$1
+                 WHERE favorite.user_id=$1 AND b.deleted_at IS NULL
+                   AND (b.owner_id=$1 OR m.id IS NOT NULL OR ($2::boolean AND wm.user_id=$1))),
+                (SELECT count(*) FROM boards b WHERE b.owner_id=$1 AND b.deleted_at IS NOT NULL)",
+        )
+        .bind(&user.id)
+        .bind(pro)
+        .fetch_one(&state.db)
+        .await?;
+        counts_queries_ms = counts_queries_started.elapsed().as_secs_f64() * 1000.0;
+        let counts = CachedDashboardCounts {
+            owned_boards,
+            favorites,
+            trash,
+        };
+        let counts_cache_write_started = Instant::now();
+        if let Err(error) = state
+            .cache
+            .set_json(
+                &counts_key,
+                &counts,
+                std::time::Duration::from_secs(DASHBOARD_COUNTS_CACHE_TTL_SECONDS),
+            )
+            .await
+        {
+            tracing::warn!(
+                subsystem = "cache",
+                event = "redis_cache_write_failed",
+                cache = "dashboard_counts",
+                %error,
+                "Dashboard counts were not cached"
+            );
+        }
+        counts_cache_write_ms = counts_cache_write_started.elapsed().as_secs_f64() * 1000.0;
+        counts
+    };
     let workspace_list_started = Instant::now();
     let workspaces = workspace_list(&state.db, &user.id, pro).await?;
     let workspace_list_ms = workspace_list_started.elapsed().as_secs_f64() * 1000.0;
@@ -512,7 +594,10 @@ async fn dashboard(
         event = "dashboard_timing",
         auth_ms,
         billing_ms,
+        counts_cache_read_ms,
+        counts_cache_hit,
         counts_queries_ms,
+        counts_cache_write_ms,
         workspace_list_ms,
         total_ms = total_started.elapsed().as_secs_f64() * 1000.0,
         is_pro = pro,
@@ -522,17 +607,20 @@ async fn dashboard(
     Ok(Json(DashboardResponse {
         capabilities: Capabilities {
             is_pro: pro,
-            owned_boards,
+            owned_boards: counts.owned_boards,
             max_owned_boards: if pro {
                 None
             } else {
                 Some(FREE_MAX_OWNED_BOARDS)
             },
-            can_create_board: pro || owned_boards < FREE_MAX_OWNED_BOARDS,
+            can_create_board: pro || counts.owned_boards < FREE_MAX_OWNED_BOARDS,
             can_save_templates: pro,
         },
         workspaces,
-        counts: DashboardCounts { favorites, trash },
+        counts: DashboardCounts {
+            favorites: counts.favorites,
+            trash: counts.trash,
+        },
     }))
 }
 
@@ -1453,6 +1541,12 @@ async fn delete_workspace(
     let mut tx = state.db.begin().await?;
     lock_resource(&mut tx, "workspaces", &workspace_id).await?;
     workspace_role(&state.db, &workspace_id, &user.id, "OWNER").await?;
+    let affected_user_ids = sqlx::query_scalar::<_, String>(
+        "SELECT user_id FROM workspace_members WHERE workspace_id=$1",
+    )
+    .bind(&workspace_id)
+    .fetch_all(&mut *tx)
+    .await?;
     sqlx::query("DELETE FROM boards WHERE workspace_id=$1")
         .bind(&workspace_id)
         .execute(&mut *tx)
@@ -1462,6 +1556,9 @@ async fn delete_workspace(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    for affected_user_id in affected_user_ids {
+        invalidate_dashboard_counts_cache(&state.cache, &affected_user_id).await;
+    }
     Ok(Json(json!({"success":true})))
 }
 
@@ -1596,7 +1693,7 @@ async fn add_member(
         NewNotification {
             actor_id: actor_id.to_string(),
             actor_name,
-            recipient_ids: vec![invitee],
+            recipient_ids: vec![invitee.clone()],
             notification_type: if workspace {
                 NotificationType::WorkspaceJoined
             } else {
@@ -1616,11 +1713,13 @@ async fn add_member(
     )
     .await?;
     tx.commit().await?;
-    members(&state.db, resource, resource_id)
+    let member = members(&state.db, resource, resource_id)
         .await?
         .into_iter()
         .find(|m| m.id == member_id)
-        .ok_or_else(|| AppError::NotFound("Member not found".into()))
+        .ok_or_else(|| AppError::NotFound("Member not found".into()))?;
+    invalidate_dashboard_counts_cache(&state.cache, &invitee).await;
+    Ok(member)
 }
 
 async fn change_member(
@@ -1737,6 +1836,7 @@ async fn change_member(
             .await?;
     }
     tx.commit().await?;
+    invalidate_dashboard_counts_cache(&state.cache, &member.user_id).await;
     for board_id in revoked_board_ids {
         state
             .collaboration
@@ -1883,6 +1983,7 @@ async fn leave_workspace(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    invalidate_dashboard_counts_cache(&state.cache, &user.id).await;
     for board_id in revoked_board_ids {
         state
             .collaboration

@@ -8,10 +8,10 @@ for credentials; never commit the connection URL.
 
 | Data | Key scope | TTL | Freshness behavior |
 | --- | --- | --- | --- |
-| Dashboard counts | User | 5 seconds | Counts may lag briefly; billing state and workspace membership are still read from PostgreSQL. |
+| Dashboard counts | User | 1 hour | Board create, rename, trash, restore, permanent delete, favorite, and collaborator-membership changes invalidate affected users' caches; the next request repopulates them from PostgreSQL. Billing state and workspace membership are always read from PostgreSQL. |
 | Owned board list first page (`scope=owned&limit=12`) | User | 5 seconds | Only the unfiltered first page is cached; create, duplicate, rename, delete, restore, and favorite changes invalidate it. The next GET refills it from PostgreSQL. |
 | Saved-template list | User | 60 seconds | The cache is deleted after save, import, and delete operations. |
-| Collaboration snapshot elements | Board and current revision | 30 seconds | Authorization and current revision are checked before a cache hit is used; older revisions have separate keys and expire. |
+| Collaboration snapshot elements | Board and current revision | 1 hour | Authorization and current revision are checked before a cache hit is used; older revisions have separate keys and expire. |
 
 Values larger than 1 MiB are not cached. If Redis cache reads or writes fail
 after startup, the handler logs a warning and continues with PostgreSQL. With
