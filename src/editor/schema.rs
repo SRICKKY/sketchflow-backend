@@ -7,6 +7,8 @@ use serde_json::{Map, Value};
 use crate::error::AppError;
 
 pub const EMBED_URL_MAX: usize = 2048;
+const MERMAID_SOURCE_MAX: usize = 200_000;
+const SVG_ELEMENT_MAX: usize = 250_000;
 
 const FILL_STYLES: &[&str] = &["solid", "hachure", "cross-hatch", "none"];
 const STROKE_STYLES: &[&str] = &["solid", "dashed", "dotted"];
@@ -227,6 +229,75 @@ fn is_note_date(value: &str) -> bool {
         })
 }
 
+fn validate_svg(svg: &str, path: &str) -> Check<()> {
+    let document =
+        roxmltree::Document::parse(svg).map_err(|_| format!("{path} must contain valid SVG"))?;
+    let root = document.root_element();
+    if root.tag_name().name() != "svg"
+        || root.tag_name().namespace() != Some("http://www.w3.org/2000/svg")
+    {
+        return Err(format!("{path} must have an SVG root element"));
+    }
+
+    let mut node_count = 0;
+    for node in document.descendants() {
+        node_count += 1;
+        if node_count > 50_000 {
+            return Err(format!("{path} contains too many SVG nodes"));
+        }
+        if !node.is_element() {
+            continue;
+        }
+        let tag = node.tag_name().name();
+        if [
+            "script",
+            "foreignObject",
+            "iframe",
+            "object",
+            "embed",
+            "audio",
+            "video",
+        ]
+        .iter()
+        .any(|forbidden| tag.eq_ignore_ascii_case(forbidden))
+        {
+            return Err(format!("{path} contains a disallowed SVG element"));
+        }
+        if tag.eq_ignore_ascii_case("style") {
+            let css = node.text().unwrap_or_default().to_ascii_lowercase();
+            if css.contains("@import")
+                || css.contains("javascript:")
+                || css.contains("expression(")
+                || (css.contains("url(")
+                    && css
+                        .split("url(")
+                        .skip(1)
+                        .any(|part| !part.trim_start().starts_with('#')))
+            {
+                return Err(format!("{path} contains unsafe SVG styles"));
+            }
+        }
+        for attribute in node.attributes() {
+            let name = attribute.name().to_ascii_lowercase();
+            let value = attribute.value().trim().to_ascii_lowercase();
+            if name.starts_with("on")
+                || (name == "href" && !value.is_empty() && !value.starts_with('#'))
+                || value.contains("javascript:")
+                || value.contains("@import")
+                || value.contains("expression(")
+                || (value.contains("url(")
+                    && value
+                        .split("url(")
+                        .skip(1)
+                        .any(|part| !part.trim_start().starts_with('#')))
+            {
+                return Err(format!("{path} contains an unsafe SVG attribute"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validates one `SketchElement`, returning it without unknown keys.
 pub fn element(value: &Value, path: &str) -> Check<Value> {
     let mut obj = Obj::new(value, path)?;
@@ -305,6 +376,18 @@ pub fn element(value: &Value, path: &str) -> Check<Value> {
         }
         "frame" => obj.string("name", true, 1, Some(80))?,
         "embed" => obj.string("url", true, 0, Some(EMBED_URL_MAX))?,
+        "svg" => {
+            obj.string("svg", true, 1, Some(SVG_ELEMENT_MAX))?;
+            if let Some(svg) = obj.field("svg", true)?.and_then(Value::as_str) {
+                validate_svg(svg, &obj.at("svg"))?;
+            }
+            obj.string("mermaidSource", false, 0, Some(MERMAID_SOURCE_MAX))?;
+            obj.one_of(
+                "mermaidTheme",
+                false,
+                &["default", "neutral", "dark", "forest", "base"],
+            )?;
+        }
         _ => {
             return Err(format!(
                 "{path}.type is not a supported canvas element type"
@@ -512,6 +595,10 @@ mod tests {
             with("note", note),
             with("frame", json!({"name":"Frame 1"})),
             with("embed", json!({"url":"https://example.com"})),
+            with(
+                "svg",
+                json!({"svg":"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><path d=\"M0 0\"/></svg>","mermaidSource":"flowchart LR; A-->B"}),
+            ),
         ];
         for sample in samples {
             let parsed = element(&sample, "el").unwrap_or_else(|e| panic!("{e}"));
@@ -561,6 +648,20 @@ mod tests {
             }),
             with("frame", json!({"name": "x".repeat(81)})),
             with("embed", json!({"url": "x".repeat(EMBED_URL_MAX + 1)})),
+            with("svg", json!({"svg":"<svg><script>alert(1)</script></svg>"})),
+            with(
+                "svg",
+                json!({"svg":"<svg xmlns=\"http://www.w3.org/2000/svg\" onload=\"alert(1)\"/>"}),
+            ),
+            with(
+                "svg",
+                json!({"svg":"<svg xmlns=\"http://www.w3.org/2000/svg\"><image href=\"https://example.com/x.png\"/></svg>"}),
+            ),
+            with("svg", json!({"svg":"x".repeat(SVG_ELEMENT_MAX + 1)})),
+            with(
+                "svg",
+                json!({"svg":"<svg xmlns=\"http://www.w3.org/2000/svg\"/>","mermaidSource":"x".repeat(MERMAID_SOURCE_MAX + 1)}),
+            ),
             base("script"),
             json!("not an object"),
         ];

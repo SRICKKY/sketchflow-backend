@@ -42,7 +42,7 @@ const PROTOCOL_VERSION: u64 = 1;
 const REDIS_CHANNEL: &str = "sketchflow:collaboration:v1";
 
 // Canvas element types accepted from clients; unknown types cannot be persisted.
-const ALLOWED_ELEMENT_TYPES: [&str; 11] = [
+const ALLOWED_ELEMENT_TYPES: [&str; 12] = [
     "rectangle",
     "ellipse",
     "diamond",
@@ -54,6 +54,7 @@ const ALLOWED_ELEMENT_TYPES: [&str; 11] = [
     "note",
     "frame",
     "embed",
+    "svg",
 ];
 
 #[derive(Clone, Default)]
@@ -1151,6 +1152,10 @@ pub(super) fn validate_operation(
             return Err(AppError::BadRequest(
                 "Unsupported canvas element type.".to_string(),
             ));
+        }
+        if element_type == "svg" {
+            crate::editor::schema::element(element, "element")
+                .map_err(|detail| AppError::BadRequest(format!("Invalid SVG element: {detail}")))?;
         }
         if !ids.insert(id.to_string()) {
             return Err(AppError::BadRequest(
