@@ -1,6 +1,6 @@
 //! Server-side port of the Next.js zod schemas in `@/lib/validation`
 //! (`elementSchema`, `presentationConfigSchema`). Like zod's default object
-//! parsing, accepted values are returned with unknown keys stripped.
+//! parsing, accepted values preserve unknown keys for forward compatibility.
 
 use serde_json::{Map, Value};
 
@@ -13,10 +13,13 @@ const SVG_ELEMENT_MAX: usize = 250_000;
 const FILL_STYLES: &[&str] = &["solid", "hachure", "cross-hatch", "none"];
 const STROKE_STYLES: &[&str] = &["solid", "dashed", "dotted"];
 const ROUNDNESS: &[&str] = &["sharp", "round", "soft"];
-const ARROWHEADS: &[&str] = &["none", "arrow", "dot"];
+const ARROWHEADS: &[&str] = &["none", "arrow", "triangle", "bar", "dot"];
 const ARROW_TYPES: &[&str] = &["sharp", "round", "elbow"];
+const ROUTE_MODES: &[&str] = &["straight", "curved", "elbow"];
 const ROUTING: &[&str] = &["straight", "elbow"];
-const BINDING_SIDES: &[&str] = &["n", "s", "e", "w", "center"];
+const BINDING_SIDES: &[&str] = &[
+    "n", "s", "e", "w", "center", "top", "right", "bottom", "left", "auto",
+];
 const FONT_FAMILIES: &[&str] = &["sans", "serif", "mono", "sketch"];
 const FONT_WEIGHTS: &[&str] = &["normal", "bold"];
 const FONT_STYLES: &[&str] = &["normal", "italic"];
@@ -34,7 +37,7 @@ fn is_int(value: f64) -> bool {
     value.fract() == 0.0
 }
 
-/// Field-by-field reader that copies only declared keys into `out`.
+/// Field-by-field reader that validates known keys and preserves forward fields.
 struct Obj<'a> {
     src: &'a Map<String, Value>,
     out: Map<String, Value>,
@@ -177,9 +180,77 @@ impl<'a> Obj<'a> {
         Ok(())
     }
 
-    fn finish(self) -> Value {
+    fn finish(mut self) -> Value {
+        for (key, value) in self.src {
+            self.out.entry(key.clone()).or_insert_with(|| value.clone());
+        }
         Value::Object(self.out)
     }
+}
+
+fn coordinate_pair(value: &Value, path: String, normalized: bool) -> Check<Value> {
+    let values = value
+        .as_array()
+        .filter(|values| values.len() == 2)
+        .ok_or_else(|| format!("{path} must be a two-number array"))?;
+    for (index, value) in values.iter().enumerate() {
+        let number = value
+            .as_f64()
+            .filter(|number| number.is_finite())
+            .ok_or_else(|| format!("{path}[{index}] must be a finite number"))?;
+        if normalized && !(0.0..=1.0).contains(&number) {
+            return Err(format!("{path}[{index}] must be between 0 and 1"));
+        }
+    }
+    Ok(Value::Array(values.clone()))
+}
+
+fn fixed_segment(value: &Value, path: String) -> Check<Value> {
+    let mut obj = Obj::new(value, path)?;
+    obj.number(
+        "index",
+        true,
+        |number| number >= 0.0 && is_int(number),
+        "must be a non-negative integer",
+    )?;
+    obj.nested("start", true, false, |value, path| {
+        coordinate_pair(value, path, false)
+    })?;
+    obj.nested("end", true, false, |value, path| {
+        coordinate_pair(value, path, false)
+    })?;
+    Ok(obj.finish())
+}
+
+fn fixed_segments(value: &Value, path: String) -> Check<Value> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| format!("{path} must be an array"))?;
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| fixed_segment(value, format!("{path}[{index}]")))
+        .collect::<Check<Vec<_>>>()
+        .map(Value::Array)
+}
+
+fn bound_element(value: &Value, path: String) -> Check<Value> {
+    let mut obj = Obj::new(value, path)?;
+    obj.string("id", true, 1, None)?;
+    obj.one_of("type", true, &["arrow"])?;
+    Ok(obj.finish())
+}
+
+fn bound_elements(value: &Value, path: String) -> Check<Value> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| format!("{path} must be an array"))?;
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| bound_element(value, format!("{path}[{index}]")))
+        .collect::<Check<Vec<_>>>()
+        .map(Value::Array)
 }
 
 fn point(value: &Value, path: String) -> Check<Value> {
@@ -192,8 +263,17 @@ fn point(value: &Value, path: String) -> Check<Value> {
 fn binding(value: &Value, path: String) -> Check<Value> {
     let mut obj = Obj::new(value, path)?;
     obj.string("elementId", true, 1, None)?;
-    obj.finite("focus")?;
+    obj.number(
+        "focus",
+        false,
+        |number| (0.0..=1.0).contains(&number),
+        "must be between 0 and 1",
+    )?;
     obj.one_of("side", false, BINDING_SIDES)?;
+    obj.nested("fixedPoint", false, false, |value, path| {
+        coordinate_pair(value, path, true)
+    })?;
+    obj.number("gap", false, |number| number >= 0.0, "must be non-negative")?;
     Ok(obj.finish())
 }
 
@@ -298,7 +378,7 @@ fn validate_svg(svg: &str, path: &str) -> Check<()> {
     Ok(())
 }
 
-/// Validates one `SketchElement`, returning it without unknown keys.
+/// Validates one `SketchElement`, preserving unknown keys for forward compatibility.
 pub fn element(value: &Value, path: &str) -> Check<Value> {
     let mut obj = Obj::new(value, path)?;
     let element_type = obj
@@ -337,16 +417,23 @@ pub fn element(value: &Value, path: &str) -> Check<Value> {
     obj.boolean("locked", true)?;
 
     match element_type.as_str() {
-        "rectangle" => fill_partition(&mut obj)?,
-        "ellipse" | "diamond" => {}
+        "rectangle" => {
+            fill_partition(&mut obj)?;
+            obj.nested("boundElements", false, false, bound_elements)?;
+        }
+        "ellipse" | "diamond" => {
+            obj.nested("boundElements", false, false, bound_elements)?;
+        }
         "line" => obj.points("points", 2)?,
         "arrow" => {
             obj.points("points", 2)?;
             obj.one_of("startArrowhead", true, ARROWHEADS)?;
             obj.one_of("endArrowhead", true, ARROWHEADS)?;
             obj.one_of("arrowType", false, ARROW_TYPES)?;
-            obj.nested("startBinding", true, true, binding)?;
-            obj.nested("endBinding", true, true, binding)?;
+            obj.one_of("routeMode", false, ROUTE_MODES)?;
+            obj.nested("startBinding", false, true, binding)?;
+            obj.nested("endBinding", false, true, binding)?;
+            obj.nested("fixedSegments", false, false, fixed_segments)?;
             obj.one_of("routing", false, ROUTING)?;
         }
         "freehand" => {
@@ -514,7 +601,7 @@ fn flow(value: &Value, path: String) -> Check<Value> {
     Ok(obj.finish())
 }
 
-/// Validates a `PresentationConfig`, returning it without unknown keys.
+/// Validates a `PresentationConfig`, preserving unknown keys for forward compatibility.
 pub fn presentation(value: &Value) -> Result<Value, AppError> {
     let parse = || -> Check<Value> {
         let mut obj = Obj::new(value, "presentation")?;
@@ -575,13 +662,16 @@ mod tests {
         let mut note = text_extra();
         note["createdAt"] = json!("2026-10-24");
         let samples = [
-            with("rectangle", json!({"fillParentId":"p","fillClip":clip})),
+            with(
+                "rectangle",
+                json!({"fillParentId":"p","fillClip":clip,"boundElements":[{"id":"arrow-1","type":"arrow"}]}),
+            ),
             base("ellipse"),
             base("diamond"),
             with("line", json!({"points":[{"x":0,"y":0},{"x":1,"y":1}]})),
             with(
                 "arrow",
-                json!({"points":[{"x":0,"y":0},{"x":1,"y":1}],"startArrowhead":"none","endArrowhead":"arrow","arrowType":"elbow","routing":"elbow","startBinding":{"elementId":"a","focus":0.5,"side":"n"},"endBinding":null}),
+                json!({"points":[{"x":0,"y":0},{"x":1,"y":1}],"startArrowhead":"triangle","endArrowhead":"bar","arrowType":"elbow","routeMode":"elbow","routing":"elbow","startBinding":{"elementId":"a","focus":0.5,"side":"top","fixedPoint":[0.5,0],"gap":8,"futureField":true},"endBinding":null,"fixedSegments":[{"index":1,"start":[10,20],"end":[30,20]}]}),
             ),
             with(
                 "freehand",
@@ -607,15 +697,15 @@ mod tests {
     }
 
     #[test]
-    fn strips_unknown_keys_like_zod() {
+    fn preserves_unknown_keys_for_forward_compatibility() {
         let mut value = with(
             "line",
             json!({"points":[{"x":0,"y":0,"pressure":1},{"x":1,"y":1}]}),
         );
         value["evil"] = json!("<script>");
         let parsed = element(&value, "el").unwrap();
-        assert!(parsed.get("evil").is_none());
-        assert!(parsed["points"][0].get("pressure").is_none());
+        assert_eq!(parsed["evil"], "<script>");
+        assert_eq!(parsed["points"][0]["pressure"], 1);
     }
 
     #[test]
@@ -628,10 +718,22 @@ mod tests {
             with("ellipse", json!({"roundness": null})),
             with("ellipse", json!({"frameId": ""})),
             with("ellipse", json!({"fillStyle": "zigzag"})),
+            with(
+                "ellipse",
+                json!({"boundElements":[{"id":"a","type":"line"}]}),
+            ),
             with("line", json!({"points":[{"x":0,"y":0}]})),
             with(
                 "arrow",
-                json!({"points":[{"x":0,"y":0},{"x":1,"y":1}],"startArrowhead":"none","endArrowhead":"arrow","endBinding":null}),
+                json!({"points":[{"x":0,"y":0},{"x":1,"y":1}],"startArrowhead":"none","endArrowhead":"invalid","endBinding":null}),
+            ),
+            with(
+                "arrow",
+                json!({"points":[{"x":0,"y":0},{"x":1,"y":1}],"startArrowhead":"none","endArrowhead":"arrow","routeMode":"orthogonal","endBinding":null}),
+            ),
+            with(
+                "arrow",
+                json!({"points":[{"x":0,"y":0},{"x":1,"y":1}],"startArrowhead":"none","endArrowhead":"arrow","startBinding":{"elementId":"a","fixedPoint":[1.1,0]},"endBinding":null}),
             ),
             with(
                 "text",
@@ -681,7 +783,7 @@ mod tests {
         });
         let parsed = presentation(&valid).unwrap();
         assert_eq!(parsed["frames"][0]["name"], "Intro");
-        assert!(parsed["frames"][0].get("junk").is_none());
+        assert_eq!(parsed["frames"][0]["junk"], 1);
         for invalid in [
             json!({}),
             json!({"frames":[{"id":"f","name":" ","order":0,"x":0,"y":0,"width":1,"height":1}]}),
