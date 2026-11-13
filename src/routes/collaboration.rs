@@ -30,7 +30,7 @@ use crate::{
 };
 
 // Bound connection memory, payload validation work, and operation history growth.
-const MAX_MESSAGE_BYTES: usize = 1_048_576;
+const MAX_MESSAGE_BYTES: usize = 2 * 1_048_576;
 const MAX_BATCH_ELEMENTS: usize = 500;
 const MAX_SELECTION_SIZE: usize = 100;
 const ROOM_CAPACITY: usize = 256;
@@ -599,6 +599,7 @@ pub async fn websocket(
     let user = session::require_current_user(&cookies, &state).await?;
     let access =
         authz::require_board_role(&state.db, &board_id, &user.id, BoardRole::Viewer).await?;
+    let is_pro = crate::editor::store::user_is_pro(&state.db, &user.id).await?;
     let request_id = request_id
         .map(|Extension(request_id)| request_id.0)
         .unwrap_or_else(crate::request_logging::generate_request_id);
@@ -606,7 +607,15 @@ pub async fn websocket(
         .max_message_size(MAX_MESSAGE_BYTES)
         .max_frame_size(MAX_MESSAGE_BYTES)
         .on_upgrade(move |socket| {
-            handle_socket(socket, state, board_id, user, access.role, request_id)
+            handle_socket(
+                socket,
+                state,
+                board_id,
+                user,
+                access.role,
+                is_pro,
+                request_id,
+            )
         }))
 }
 
@@ -648,6 +657,7 @@ async fn handle_socket(
     board_id: String,
     user: User,
     role: BoardRole,
+    mut is_pro: bool,
     request_id: String,
 ) {
     let connection_started = Instant::now();
@@ -870,32 +880,42 @@ async fn handle_socket(
                                     }
                                     continue;
                                 }
-                                let operation = match validate_operation(&client_operation_id, batch)
-                                    .map(|batch| (batch, client_operation_id))
-                                {
-                                    Ok((batch, operation_id)) => {
-                                        match authz::require_board_role(
-                                            &state.db,
-                                            &board_id,
-                                            &user.id,
-                                            BoardRole::Editor,
-                                        )
-                                        .await
-                                        {
-                                            Ok(_) => persist_operation(
-                                                &state,
-                                                &board_id,
-                                                &user.id,
-                                                &operation_id,
-                                                base_revision,
-                                                batch,
+                                let operation = async {
+                                    authz::require_board_role(
+                                        &state.db,
+                                        &board_id,
+                                        &user.id,
+                                        BoardRole::Editor,
+                                    )
+                                    .await?;
+                                    let svg_limit = if crate::editor::schema::contains_svg(
+                                        &batch.upserts,
+                                    ) {
+                                        crate::editor::schema::svg_element_limit(
+                                            crate::editor::store::user_is_pro(
+                                                &state.db, &user.id,
                                             )
-                                            .await,
-                                            Err(error) => Err(error),
-                                        }
-                                    }
-                                    Err(error) => Err(error),
-                                };
+                                            .await?,
+                                        )
+                                    } else {
+                                        crate::editor::schema::SVG_ELEMENT_PRO_MAX
+                                    };
+                                    let batch = validate_operation_with_svg_limit(
+                                        &client_operation_id,
+                                        batch,
+                                        svg_limit,
+                                    )?;
+                                    persist_operation(
+                                        &state,
+                                        &board_id,
+                                        &user.id,
+                                        &client_operation_id,
+                                        base_revision,
+                                        batch,
+                                    )
+                                    .await
+                                }
+                                .await;
                                 match operation {
                                     // Persist before publishing so peers never observe an uncommitted change.
                                     Ok(operation) => {
@@ -944,7 +964,10 @@ async fn handle_socket(
                                     );
                                     break;
                                 }
-                                match validate_preview(batch) {
+                                match validate_preview_with_svg_limit(
+                                    batch,
+                                    crate::editor::schema::svg_element_limit(is_pro),
+                                ) {
                                     Ok(batch) => publish_message(
                                         &state.collaboration,
                                         &board_id,
@@ -1022,7 +1045,20 @@ async fn handle_socket(
             }
             _ = authorization_check.tick() => {
                 match authz::get_board_access(&state.db, &board_id, &user.id).await {
-                    Ok(Some(access)) if access.role >= BoardRole::Viewer => {}
+                    Ok(Some(access)) if access.role >= BoardRole::Viewer => {
+                        match crate::editor::store::user_is_pro(&state.db, &user.id).await {
+                            Ok(current_plan) => is_pro = current_plan,
+                            Err(error) => {
+                                tracing::warn!(
+                                    event = "connection_plan_check_failed",
+                                    error = %error,
+                                    "Failed to refresh collaboration plan"
+                                );
+                                disconnect_reason = "plan_check_failed";
+                                break;
+                            }
+                        }
+                    }
                     Ok(_) => {
                         disconnect_reason = "authorization_revoked";
                         tracing::info!(
@@ -1113,6 +1149,18 @@ pub(super) fn validate_operation(
     client_operation_id: &str,
     batch: ElementBatch,
 ) -> AppResult<ElementBatch> {
+    validate_operation_with_svg_limit(
+        client_operation_id,
+        batch,
+        crate::editor::schema::SVG_ELEMENT_PRO_MAX,
+    )
+}
+
+pub(super) fn validate_operation_with_svg_limit(
+    client_operation_id: &str,
+    batch: ElementBatch,
+    svg_element_max: usize,
+) -> AppResult<ElementBatch> {
     // Operation IDs are constrained because they are persisted as idempotency keys.
     if client_operation_id.is_empty()
         || client_operation_id.len() > 128
@@ -1154,7 +1202,7 @@ pub(super) fn validate_operation(
             ));
         }
         if element_type == "svg" {
-            crate::editor::schema::element(element, "element")
+            crate::editor::schema::element_with_svg_limit(element, "element", svg_element_max)
                 .map_err(|detail| AppError::BadRequest(format!("Invalid SVG element: {detail}")))?;
         }
         if !ids.insert(id.to_string()) {
@@ -1174,10 +1222,17 @@ pub(super) fn validate_operation(
 }
 
 fn validate_preview(batch: ElementBatch) -> AppResult<ElementBatch> {
+    validate_preview_with_svg_limit(batch, crate::editor::schema::SVG_ELEMENT_PRO_MAX)
+}
+
+fn validate_preview_with_svg_limit(
+    batch: ElementBatch,
+    svg_element_max: usize,
+) -> AppResult<ElementBatch> {
     if batch.upserts.is_empty() && batch.deleted_ids.is_empty() {
         return Ok(batch);
     }
-    validate_operation("preview", batch)
+    validate_operation_with_svg_limit("preview", batch, svg_element_max)
 }
 
 /// Checks transient cursor and selection values before they are broadcast.
@@ -1378,6 +1433,34 @@ mod tests {
         json!({"id": id, "type": element_type})
     }
 
+    fn svg_element(id: &str, text_len: usize) -> Value {
+        json!({
+            "id": id,
+            "type": "svg",
+            "x": 0,
+            "y": 0,
+            "width": 100,
+            "height": 100,
+            "rotation": 0,
+            "strokeColor": "#000",
+            "backgroundColor": "transparent",
+            "strokeWidth": 1,
+            "opacity": 1,
+            "fillStyle": "solid",
+            "strokeStyle": "solid",
+            "roughness": 0,
+            "seed": 1,
+            "groupId": null,
+            "frameId": null,
+            "zIndex": 0,
+            "locked": false,
+            "svg": format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\"><text>{}</text></svg>",
+                "x".repeat(text_len)
+            )
+        })
+    }
+
     #[test]
     fn validates_well_formed_element_batches() {
         let batch = ElementBatch {
@@ -1385,6 +1468,30 @@ mod tests {
             deleted_ids: vec!["el-2".to_string()],
         };
         assert!(validate_operation("client-1", batch).is_ok());
+    }
+
+    #[test]
+    fn collaboration_operations_use_the_account_svg_limit() {
+        let batch = || ElementBatch {
+            upserts: vec![svg_element(
+                "svg-1",
+                crate::editor::schema::SVG_ELEMENT_FREE_MAX + 1,
+            )],
+            deleted_ids: vec![],
+        };
+
+        assert!(validate_operation_with_svg_limit(
+            "client-1",
+            batch(),
+            crate::editor::schema::svg_element_limit(false),
+        )
+        .is_err());
+        assert!(validate_operation_with_svg_limit(
+            "client-1",
+            batch(),
+            crate::editor::schema::svg_element_limit(true),
+        )
+        .is_ok());
     }
 
     #[test]
