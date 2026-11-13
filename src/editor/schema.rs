@@ -8,7 +8,7 @@ use crate::error::AppError;
 
 pub const EMBED_URL_MAX: usize = 2048;
 const MERMAID_SOURCE_MAX: usize = 200_000;
-const SVG_ELEMENT_MAX: usize = 250_000;
+const SVG_ELEMENT_MAX: usize = 1_000_000;
 
 const FILL_STYLES: &[&str] = &["solid", "hachure", "cross-hatch", "none"];
 const STROKE_STYLES: &[&str] = &["solid", "dashed", "dotted"];
@@ -604,6 +604,17 @@ mod tests {
             let parsed = element(&sample, "el").unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(parsed, sample);
         }
+    }
+
+    #[test]
+    fn accepts_svg_element_larger_than_previous_limit() {
+        let svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"><text>{}</text></svg>",
+            "x".repeat(300_000)
+        );
+        let parsed = element(&with("svg", json!({"svg": svg})), "el").unwrap();
+
+        assert!(parsed["svg"].as_str().unwrap().len() > 250_000);
     }
 
     #[test]
