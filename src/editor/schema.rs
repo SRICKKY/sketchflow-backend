@@ -8,7 +8,9 @@ use crate::error::AppError;
 
 pub const EMBED_URL_MAX: usize = 2048;
 const MERMAID_SOURCE_MAX: usize = 200_000;
-const SVG_ELEMENT_MAX: usize = 1_000_000;
+pub const SVG_ELEMENT_FREE_MAX: usize = 250_000;
+pub const SVG_ELEMENT_PRO_MAX: usize = 1_000_000;
+const SVG_ELEMENT_MAX: usize = SVG_ELEMENT_PRO_MAX;
 
 const FILL_STYLES: &[&str] = &["solid", "hachure", "cross-hatch", "none"];
 const STROKE_STYLES: &[&str] = &["solid", "dashed", "dotted"];
@@ -300,6 +302,25 @@ fn validate_svg(svg: &str, path: &str) -> Check<()> {
 
 /// Validates one `SketchElement`, returning it without unknown keys.
 pub fn element(value: &Value, path: &str) -> Check<Value> {
+    element_with_svg_limit(value, path, SVG_ELEMENT_MAX)
+}
+
+pub fn svg_element_limit(is_pro: bool) -> usize {
+    if is_pro {
+        SVG_ELEMENT_PRO_MAX
+    } else {
+        SVG_ELEMENT_FREE_MAX
+    }
+}
+
+pub fn contains_svg(values: &[Value]) -> bool {
+    values
+        .iter()
+        .any(|value| value.get("type").and_then(Value::as_str) == Some("svg"))
+}
+
+/// Validates one `SketchElement` using the active account's SVG size limit.
+pub fn element_with_svg_limit(value: &Value, path: &str, svg_element_max: usize) -> Check<Value> {
     let mut obj = Obj::new(value, path)?;
     let element_type = obj
         .field("type", true)?
@@ -377,7 +398,7 @@ pub fn element(value: &Value, path: &str) -> Check<Value> {
         "frame" => obj.string("name", true, 1, Some(80))?,
         "embed" => obj.string("url", true, 0, Some(EMBED_URL_MAX))?,
         "svg" => {
-            obj.string("svg", true, 1, Some(SVG_ELEMENT_MAX))?;
+            obj.string("svg", true, 1, Some(svg_element_max))?;
             if let Some(svg) = obj.field("svg", true)?.and_then(Value::as_str) {
                 validate_svg(svg, &obj.at("svg"))?;
             }
@@ -397,12 +418,17 @@ pub fn element(value: &Value, path: &str) -> Check<Value> {
     Ok(obj.finish())
 }
 
-/// Validates a list of elements, mapping failures to a 400 with `context`.
-pub fn elements(values: &[Value], context: &str) -> Result<Vec<Value>, AppError> {
+pub fn elements_with_svg_limit(
+    values: &[Value],
+    context: &str,
+    svg_element_max: usize,
+) -> Result<Vec<Value>, AppError> {
     values
         .iter()
         .enumerate()
-        .map(|(index, value)| element(value, &format!("elements[{index}]")))
+        .map(|(index, value)| {
+            element_with_svg_limit(value, &format!("elements[{index}]"), svg_element_max)
+        })
         .collect::<Check<Vec<_>>>()
         .map_err(|detail| AppError::BadRequest(format!("{context}: {detail}")))
 }
@@ -607,14 +633,15 @@ mod tests {
     }
 
     #[test]
-    fn accepts_svg_element_larger_than_previous_limit() {
+    fn enforces_plan_specific_svg_limits() {
         let svg = format!(
             "<svg xmlns=\"http://www.w3.org/2000/svg\"><text>{}</text></svg>",
-            "x".repeat(300_000)
+            "x".repeat(SVG_ELEMENT_FREE_MAX + 1)
         );
-        let parsed = element(&with("svg", json!({"svg": svg})), "el").unwrap();
+        let value = with("svg", json!({"svg": svg}));
 
-        assert!(parsed["svg"].as_str().unwrap().len() > 250_000);
+        assert!(element_with_svg_limit(&value, "el", svg_element_limit(false)).is_err());
+        assert!(element_with_svg_limit(&value, "el", svg_element_limit(true)).is_ok());
     }
 
     #[test]

@@ -197,7 +197,12 @@ async fn patch_elements(
     let user = session::require_current_user(&cookies, &state).await?;
     authz::require_board_role(&state.db, &board_id, &user.id, BoardRole::Editor).await?;
     store::validate_client_operation_id(&input.client_operation_id)?;
-    let upserts = schema::elements(&input.upserts, "Invalid board data")?;
+    let svg_limit = if schema::contains_svg(&input.upserts) {
+        schema::svg_element_limit(store::user_is_pro(&state.db, &user.id).await?)
+    } else {
+        schema::SVG_ELEMENT_PRO_MAX
+    };
+    let upserts = schema::elements_with_svg_limit(&input.upserts, "Invalid board data", svg_limit)?;
     let batch = collaboration::validate_operation(
         &input.client_operation_id,
         ElementBatch {
@@ -240,7 +245,13 @@ async fn put_document(
     let user = session::require_current_user(&cookies, &state).await?;
     authz::require_board_role(&state.db, &board_id, &user.id, BoardRole::Editor).await?;
     store::validate_client_operation_id(&input.client_operation_id)?;
-    let elements = schema::elements(&input.elements, "Invalid board data")?;
+    let svg_limit = if schema::contains_svg(&input.elements) {
+        schema::svg_element_limit(store::user_is_pro(&state.db, &user.id).await?)
+    } else {
+        schema::SVG_ELEMENT_PRO_MAX
+    };
+    let elements =
+        schema::elements_with_svg_limit(&input.elements, "Invalid board data", svg_limit)?;
     if elements.len() > 5_000 {
         return Err(AppError::BadRequest(
             "Boards support at most 5000 elements.".into(),
@@ -441,7 +452,13 @@ async fn restore_version(
     .fetch_optional(&state.db)
     .await?
     .ok_or_else(|| AppError::NotFound("Version not found".into()))?;
-    let elements = schema::elements(&version.0 .0, "Stored version is invalid")?;
+    let svg_limit = if schema::contains_svg(&version.0 .0) {
+        schema::svg_element_limit(store::user_is_pro(&state.db, &user.id).await?)
+    } else {
+        schema::SVG_ELEMENT_PRO_MAX
+    };
+    let elements =
+        schema::elements_with_svg_limit(&version.0 .0, "Stored version is invalid", svg_limit)?;
     let presentation = version
         .1
         .map(|value| schema::presentation(&value))

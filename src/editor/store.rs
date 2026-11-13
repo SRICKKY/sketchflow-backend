@@ -57,7 +57,11 @@ pub fn version_cap(is_pro: bool) -> i64 {
 }
 
 pub async fn owner_is_pro(db: &PgPool, owner_id: &str) -> AppResult<bool> {
-    Ok(billing::get_billing_state(db, owner_id).await?.status == BillingStatus::Active)
+    user_is_pro(db, owner_id).await
+}
+
+pub async fn user_is_pro(db: &PgPool, user_id: &str) -> AppResult<bool> {
+    Ok(billing::get_billing_state(db, user_id).await?.status == BillingStatus::Active)
 }
 
 /// Validates the idempotency key shared by WebSocket and REST writers.
