@@ -62,6 +62,7 @@ printpdf = "0.12"
 
 # Misc
 mime_guess = "2"
+roxmltree = "=0.21.1"
 thiserror = "2"
 anyhow = "1"
 dotenvy = "0.15"
