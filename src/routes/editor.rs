@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     routing::{get, patch, post, put},
     Json, Router,
@@ -17,6 +17,7 @@ use crate::{
     editor::{schema, store},
     error::{AppError, AppResult},
     extract::AppJson,
+    request_logging::RequestId,
     routes::collaboration::{self, ElementBatch},
     routes::notifications::{self, NewNotification, NotificationType},
     state::AppState,
@@ -25,6 +26,57 @@ use crate::{
 const COMMENT_EMOJIS: [&str; 11] = [
     "👍", "👀", "😊", "❤️", "🎉", "🙏", "✅", "🔥", "🚀", "👏", "😕",
 ];
+
+fn request_id_value(request_id: Option<Extension<RequestId>>) -> String {
+    request_id
+        .map(|Extension(request_id)| request_id.0)
+        .unwrap_or_else(crate::request_logging::generate_request_id)
+}
+
+fn log_sync_error(board_id: &str, actor_id: &str, request_id: &str, error: &AppError) {
+    match error {
+        AppError::RevisionConflict { code, revision, .. } => tracing::warn!(
+            subsystem = "board_sync",
+            event = "board_sync_write_conflict",
+            board_id = %board_id,
+            request_id = %request_id,
+            actor_id = %actor_id,
+            outcome = "conflict",
+            code = *code,
+            revision = *revision,
+            "Board write rejected by revision check"
+        ),
+        AppError::Conflict(message) => tracing::warn!(
+            subsystem = "board_sync",
+            event = "board_sync_write_conflict",
+            board_id = %board_id,
+            request_id = %request_id,
+            actor_id = %actor_id,
+            outcome = "conflict",
+            code = if message.starts_with("Client operation ID") {
+                "OPERATION_ID_REUSED"
+            } else {
+                "CONFLICT"
+            },
+            "Board write rejected by conflict check"
+        ),
+        _ => {}
+    }
+}
+
+fn log_sync_replay(board_id: &str, actor_id: &str, request_id: &str, replayed: bool) {
+    if replayed {
+        tracing::info!(
+            subsystem = "board_sync",
+            event = "board_sync_operation_replayed",
+            board_id = %board_id,
+            request_id = %request_id,
+            actor_id = %actor_id,
+            outcome = "replayed",
+            "Previously applied board operation returned"
+        );
+    }
+}
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -192,8 +244,10 @@ async fn patch_elements(
     State(state): State<AppState>,
     cookies: Cookies,
     Path(board_id): Path<String>,
+    request_id: Option<Extension<RequestId>>,
     AppJson(input): AppJson<PatchElementsInput>,
 ) -> AppResult<Json<Value>> {
+    let request_id = request_id_value(request_id);
     let user = session::require_current_user(&cookies, &state).await?;
     authz::require_board_role(&state.db, &board_id, &user.id, BoardRole::Editor).await?;
     store::validate_client_operation_id(&input.client_operation_id)?;
@@ -218,7 +272,12 @@ async fn patch_elements(
         Some(input.base_revision),
         batch,
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        log_sync_error(&board_id, &user.id, &request_id, &error);
+        error
+    })?;
+    log_sync_replay(&board_id, &user.id, &request_id, operation.replayed);
     collaboration::broadcast_editor_operation(&state.collaboration, &board_id, &operation, false)
         .await;
     if !operation.replayed {
@@ -240,8 +299,10 @@ async fn put_document(
     State(state): State<AppState>,
     cookies: Cookies,
     Path(board_id): Path<String>,
+    request_id: Option<Extension<RequestId>>,
     AppJson(input): AppJson<DocumentInput>,
 ) -> AppResult<Json<Value>> {
+    let request_id = request_id_value(request_id);
     let user = session::require_current_user(&cookies, &state).await?;
     authz::require_board_role(&state.db, &board_id, &user.id, BoardRole::Editor).await?;
     store::validate_client_operation_id(&input.client_operation_id)?;
@@ -280,7 +341,11 @@ async fn put_document(
         elements,
         &request,
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        log_sync_error(&board_id, &user.id, &request_id, &error);
+        error
+    })?;
     if let Some(presentation) = presentation {
         sqlx::query("UPDATE boards SET presentation = $2 WHERE id = $1")
             .bind(&board_id)
@@ -289,6 +354,7 @@ async fn put_document(
             .await?;
     }
     tx.commit().await?;
+    log_sync_replay(&board_id, &user.id, &request_id, operation.replayed);
     collaboration::broadcast_editor_operation(
         &state.collaboration,
         &board_id,
@@ -314,8 +380,10 @@ async fn patch_presentation(
     State(state): State<AppState>,
     cookies: Cookies,
     Path(board_id): Path<String>,
+    request_id: Option<Extension<RequestId>>,
     AppJson(input): AppJson<PresentationInput>,
 ) -> AppResult<Json<Value>> {
+    let request_id = request_id_value(request_id);
     let user = session::require_current_user(&cookies, &state).await?;
     authz::require_board_role(&state.db, &board_id, &user.id, BoardRole::Editor).await?;
     store::validate_client_operation_id(&input.client_operation_id)?;
@@ -328,7 +396,12 @@ async fn patch_presentation(
         input.base_revision,
         presentation,
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        log_sync_error(&board_id, &user.id, &request_id, &error);
+        error
+    })?;
+    log_sync_replay(&board_id, &user.id, &request_id, operation.replayed);
     collaboration::broadcast_editor_operation(&state.collaboration, &board_id, &operation, true)
         .await;
     if !operation.replayed {
@@ -434,8 +507,10 @@ async fn restore_version(
     State(state): State<AppState>,
     cookies: Cookies,
     Path((board_id, version_id)): Path<(String, String)>,
+    request_id: Option<Extension<RequestId>>,
     AppJson(input): AppJson<RestoreVersionInput>,
 ) -> AppResult<Json<Value>> {
+    let request_id = request_id_value(request_id);
     let user = session::require_current_user(&cookies, &state).await?;
     let access =
         authz::require_board_role(&state.db, &board_id, &user.id, BoardRole::Editor).await?;
@@ -502,13 +577,18 @@ async fn restore_version(
         elements,
         &request,
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        log_sync_error(&board_id, &user.id, &request_id, &error);
+        error
+    })?;
     sqlx::query("UPDATE boards SET presentation = $2 WHERE id = $1")
         .bind(&board_id)
         .bind(presentation)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    log_sync_replay(&board_id, &user.id, &request_id, operation.replayed);
     collaboration::broadcast_editor_operation(&state.collaboration, &board_id, &operation, true)
         .await;
     Ok(Json(json!({
