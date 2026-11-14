@@ -920,7 +920,12 @@ async fn handle_socket(
                                     // Persist before publishing so peers never observe an uncommitted change.
                                     Ok(operation) => {
                                         tracing::info!(
+                                            subsystem = "board_sync",
                                             event = "collaboration_operation_applied",
+                                            board_id = %board_id,
+                                            request_id = %request_id,
+                                            actor_id = %user.id,
+                                            outcome = if operation.replayed { "replayed" } else { "applied" },
                                             revision = operation.revision,
                                             upsert_count = operation.batch.upserts.len(),
                                             delete_count = operation.batch.deleted_ids.len(),
@@ -940,8 +945,25 @@ async fn handle_socket(
                                         ).await
                                     }
                                     Err(error) => {
+                                        let outcome = match &error {
+                                            crate::error::AppError::RevisionConflict { .. } => {
+                                                "revision_conflict"
+                                            }
+                                            crate::error::AppError::Conflict(message)
+                                                if message.starts_with("Client operation ID") =>
+                                            {
+                                                "operation_id_reused"
+                                            }
+                                            crate::error::AppError::Conflict(_) => "conflict",
+                                            _ => "failed",
+                                        };
                                         tracing::warn!(
+                                            subsystem = "board_sync",
                                             event = "collaboration_operation_failed",
+                                            board_id = %board_id,
+                                            request_id = %request_id,
+                                            actor_id = %user.id,
+                                            outcome,
                                             reason = "operation_rejected_or_persistence_failed",
                                             "Collaboration operation failed"
                                         );
