@@ -37,6 +37,33 @@ use state::AppState;
 // Allow the largest accepted file plus multipart fields and framing overhead.
 const MAX_MULTIPART_BODY_BYTES: usize = profile::avatar::AVATAR_MAX_BYTES as usize + 1024 * 1024;
 
+fn cors_layer(configured_origins: &[String]) -> CorsLayer {
+    let origins: Vec<_> = configured_origins
+        .iter()
+        .filter_map(|origin| origin.parse().ok())
+        .collect();
+
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_credentials(true)
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::COOKIE,
+            axum::http::header::HeaderName::from_static("x-request-id"),
+        ])
+        .expose_headers([axum::http::header::HeaderName::from_static("x-request-id")])
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::PATCH,
+            axum::http::Method::PUT,
+            axum::http::Method::DELETE,
+            axum::http::Method::OPTIONS,
+        ])
+        .max_age(Duration::from_secs(86_400))
+}
+
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
@@ -148,29 +175,7 @@ async fn main() {
         }
     });
 
-    let origins: Vec<_> = config
-        .cors_allowed_origins
-        .iter()
-        .filter_map(|o| o.parse().ok())
-        .collect();
-    let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::list(origins))
-        .allow_credentials(true)
-        .allow_headers([
-            axum::http::header::CONTENT_TYPE,
-            axum::http::header::AUTHORIZATION,
-            axum::http::header::COOKIE,
-            axum::http::header::HeaderName::from_static("x-request-id"),
-        ])
-        .expose_headers([axum::http::header::HeaderName::from_static("x-request-id")])
-        .allow_methods([
-            axum::http::Method::GET,
-            axum::http::Method::POST,
-            axum::http::Method::PATCH,
-            axum::http::Method::PUT,
-            axum::http::Method::DELETE,
-            axum::http::Method::OPTIONS,
-        ]);
+    let cors = cors_layer(&config.cors_allowed_origins);
 
     let app = Router::new()
         .route("/health", get(routes::health::health))
@@ -340,6 +345,33 @@ mod tests {
             )
             .body(Body::from(body))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_caches_permission_for_one_day() {
+        let origins = vec!["https://sketchflow.online".to_owned()];
+        let app = Router::new()
+            .route("/api/test", patch(|| async { StatusCode::NO_CONTENT }))
+            .layer(cors_layer(&origins));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/test")
+                    .header("origin", "https://sketchflow.online")
+                    .header("access-control-request-method", "PATCH")
+                    .header("access-control-request-headers", "content-type")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(response.status().is_success());
+        assert_eq!(
+            response.headers().get("access-control-max-age").unwrap(),
+            "86400"
+        );
     }
 
     #[tokio::test]
