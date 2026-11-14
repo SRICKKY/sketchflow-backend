@@ -65,6 +65,10 @@ impl BodyCapture {
     }
 }
 
+fn should_capture_payload(environment: &str, is_json: bool) -> bool {
+    is_json && environment != "production"
+}
+
 pub async fn log_request_payload(request: Request<Body>, next: Next) -> Response {
     let (mut parts, body) = request.into_parts();
     let method = parts.method.clone();
@@ -87,6 +91,9 @@ pub async fn log_request_payload(request: Request<Body>, next: Next) -> Response
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     let is_json = content_type.as_deref().is_some_and(is_json_content_type);
+    let environment = app_environment();
+    let production = environment == "production";
+    let capture_payload = should_capture_payload(environment, is_json);
     let content_length = parts
         .headers
         .get(header::CONTENT_LENGTH)
@@ -100,7 +107,7 @@ pub async fn log_request_payload(request: Request<Body>, next: Next) -> Response
             body_capture
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .record(data.as_ref(), is_json);
+                .record(data.as_ref(), capture_payload);
         }
         frame
     });
@@ -108,7 +115,7 @@ pub async fn log_request_payload(request: Request<Body>, next: Next) -> Response
     let span = tracing::info_span!(
         "http_request",
         service = "sketchflow-api",
-        environment = app_environment(),
+        environment,
         request_id = %request_id,
         method = %method,
         endpoint = %path,
@@ -121,22 +128,39 @@ pub async fn log_request_payload(request: Request<Body>, next: Next) -> Response
         let capture = capture
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let payload = format_payload(&capture, is_json, content_length, content_type.as_deref());
-
-        tracing::info!(
-            service = "sketchflow-api",
-            environment = app_environment(),
-            request_id = %request_id,
-            subsystem = "http",
-            event = "request_completed",
-            method = %method,
-            endpoint = %path,
-            status = response.status().as_u16(),
-            duration_ms = started.elapsed().as_millis() as u64,
-            body_bytes_observed = capture.observed_bytes,
-            request_payload = %payload,
-            "HTTP request completed"
-        );
+        let body_bytes_observed = capture.observed_bytes;
+        if production {
+            tracing::info!(
+                service = "sketchflow-api",
+                environment,
+                request_id = %request_id,
+                subsystem = "http",
+                event = "request_completed",
+                method = %method,
+                endpoint = %path,
+                status = response.status().as_u16(),
+                duration_ms = started.elapsed().as_millis() as u64,
+                body_bytes_observed,
+                "HTTP request completed"
+            );
+        } else {
+            let payload =
+                format_payload(&capture, is_json, content_length, content_type.as_deref());
+            tracing::info!(
+                service = "sketchflow-api",
+                environment,
+                request_id = %request_id,
+                subsystem = "http",
+                event = "request_completed",
+                method = %method,
+                endpoint = %path,
+                status = response.status().as_u16(),
+                duration_ms = started.elapsed().as_millis() as u64,
+                body_bytes_observed,
+                request_payload = %payload,
+                "HTTP request completed"
+            );
+        }
 
         response.headers_mut().insert(
             &REQUEST_ID_HEADER,
@@ -279,7 +303,27 @@ mod tests {
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
-    use super::{format_payload, log_request_payload, redact_sensitive_fields, BodyCapture};
+    use super::{
+        format_payload, log_request_payload, redact_sensitive_fields, should_capture_payload,
+        BodyCapture,
+    };
+
+    #[test]
+    fn production_requests_count_bytes_without_capturing_json() {
+        let body = br#"{"elements":[{"id":"private-board-data"}]}"#;
+        let mut capture = BodyCapture::default();
+        capture.record(body, should_capture_payload("production", true));
+
+        assert_eq!(capture.observed_bytes, body.len());
+        assert!(capture.bytes.is_empty());
+        assert!(!capture.truncated);
+    }
+
+    #[test]
+    fn non_production_json_payload_capture_remains_enabled() {
+        assert!(should_capture_payload("development", true));
+        assert!(!should_capture_payload("development", false));
+    }
 
     #[test]
     fn redacts_sensitive_fields_recursively() {
