@@ -482,11 +482,17 @@ pub async fn get_asset(
     Path(asset_id): Path<String>,
 ) -> AppResult<Response> {
     let board_ids = assets::asset_board_ids(&state.db, &asset_id).await?;
-    let is_board_asset = !board_ids.is_empty();
-    if is_board_asset {
+    let library_owner_ids = assets::asset_library_owner_ids(&state.db, &asset_id).await?;
+    let is_private_asset = !board_ids.is_empty() || !library_owner_ids.is_empty();
+    if is_private_asset {
         let user = session::require_current_user(&cookies, &state).await?;
-        let mut authorized = false;
+        let mut authorized = library_owner_ids
+            .iter()
+            .any(|owner_id| owner_id == &user.id);
         for board_id in board_ids {
+            if authorized {
+                break;
+            }
             if let Some(access) = authz::get_board_access(&state.db, &board_id, &user.id).await? {
                 if access.role >= BoardRole::Viewer {
                     authorized = true;
@@ -504,7 +510,7 @@ pub async fn get_asset(
     let asset = assets::read_asset(&state.db, &state.config, &asset_id)
         .await?
         .ok_or_else(|| AppError::NotFound("Not found".to_string()))?;
-    let cache_control = if is_board_asset {
+    let cache_control = if is_private_asset {
         "private, no-store"
     } else {
         "public, max-age=31536000, immutable"

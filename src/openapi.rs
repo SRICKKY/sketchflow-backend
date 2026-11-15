@@ -2,7 +2,8 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::routes::{
-    auth, billing, collaboration, health, invoices, notifications, profile, uploads,
+    auth, billing, collaboration, dashboard, health, invoices, library, notifications, profile,
+    uploads,
 };
 
 /// Aggregated OpenAPI document for the SketchFlow backend. Each module's
@@ -13,7 +14,7 @@ use crate::routes::{
     info(
         title = "SketchFlow API",
         version = "0.1.0",
-        description = "REST API for SketchFlow: auth, billing, profile, board collaboration, notifications, uploads and invoices.",
+        description = "REST API for SketchFlow: auth, billing, profile, board collaboration, personal and collection shape libraries, notifications, uploads and invoices.",
         license(name = "UNLICENSED")
     ),
     tags(
@@ -23,6 +24,8 @@ use crate::routes::{
         (name = "profile", description = "User profile, credentials, and avatar management"),
         (name = "uploads", description = "Board image asset uploads"),
         (name = "collaboration", description = "Board snapshots and live collaboration"),
+        (name = "library", description = "Personal and private-collection shape libraries"),
+        (name = "collections", description = "Private collection lifecycle and duplication"),
         (name = "notifications", description = "In-app notifications"),
         (name = "invoices", description = "Invoice retrieval and PDF export")
     ),
@@ -52,12 +55,31 @@ use crate::routes::{
         uploads::abort_upload,
         uploads::get_asset,
         collaboration::snapshot,
+        library::list_items,
+        library::create_item,
+        library::rename_item,
+        library::delete_item,
+        library::list_collection_items,
+        library::create_collection_item,
+        library::rename_collection_item,
+        library::delete_collection_item,
+        library::reorder_personal_items,
+        library::reorder_collection_items,
+        library::copy_item,
+        library::move_item,
+        library::board_libraries,
         notifications::list_notifications,
         notifications::unread_notification_count,
         notifications::mark_notification_read,
         notifications::mark_all_notifications_read,
         invoices::list_invoices,
-        invoices::download_invoice_pdf
+        invoices::download_invoice_pdf,
+        dashboard::list_private_collections,
+        dashboard::create_private_collection,
+        dashboard::delete_private_collection,
+        dashboard::restore_private_collection,
+        dashboard::permanently_delete_private_collection,
+        dashboard::duplicate_private_collection
     ),
     components(schemas(
         health::HealthResponse,
@@ -86,6 +108,22 @@ use crate::routes::{
         uploads::PresignUploadResponse,
         uploads::UploadResponse,
         collaboration::SnapshotResponse,
+        library::CreateItemInput,
+        library::RenameItemInput,
+        library::LibraryItem,
+        library::LibraryItems,
+        library::CollectionLibraryPage,
+        library::BoardLibrariesResponse,
+        library::LibraryDescriptor,
+        library::LibraryQuery,
+        library::ReorderInput,
+        library::TransferInput,
+        library::TransferTarget,
+        library::TransferCollection,
+        dashboard::PrivateCollectionInput,
+        dashboard::DuplicateCollectionInput,
+        dashboard::PrivateCollectionSummary,
+        dashboard::PrivateCollectionsResponse,
         notifications::NotificationType,
         notifications::NotificationItem,
         notifications::NotificationPage,

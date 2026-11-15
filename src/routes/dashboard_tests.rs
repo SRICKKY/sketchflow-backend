@@ -194,6 +194,7 @@ async fn dashboard_http_flows_and_authorization() {
     };
     let app = router()
         .merge(super::super::editor::router())
+        .merge(super::super::library::router())
         .merge(super::super::public_links::router())
         .route(
             "/api/boards/{board_id}/snapshot",
@@ -220,6 +221,87 @@ async fn dashboard_http_flows_and_authorization() {
     let admin_token = token("admin");
     let member_token = token("member");
     let expired = token("expired");
+    sqlx::query(
+        "INSERT INTO boards(id,name,owner_id) VALUES('library-source','Library source','free')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    let library_element = json!({
+        "id":"library-shape",
+        "type":"rectangle",
+        "x":0.0,
+        "y":0.0,
+        "width":100.0,
+        "height":80.0,
+        "rotation":0.0,
+        "strokeColor":"#1e1e1e",
+        "backgroundColor":"transparent",
+        "strokeWidth":2.0,
+        "opacity":1.0,
+        "fillStyle":"solid",
+        "strokeStyle":"solid",
+        "roughness":0.0,
+        "seed":1.0,
+        "groupId":null,
+        "zIndex":0.0,
+        "locked":false
+    });
+    let library_item = request(
+        &app,
+        Some(&free),
+        "POST",
+        "/api/library/items",
+        Some(json!({
+            "name":"Reusable shape",
+            "sourceBoardId":"library-source",
+            "elements":[library_element.clone()]
+        })),
+        201,
+    )
+    .await;
+    let library_item_id = library_item["id"].as_str().unwrap();
+    assert_eq!(library_item["elementCount"], 1);
+    let personal_library_scope: String = sqlx::query_scalar(
+        "SELECT scope FROM libraries
+         JOIN library_items item ON item.library_id=libraries.id
+         WHERE item.id=$1 AND libraries.owner_id='free'",
+    )
+    .bind(library_item_id)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(personal_library_scope, "user");
+    let free_library = request(&app, Some(&free), "GET", "/api/library/items", None, 200).await;
+    assert_eq!(free_library["items"].as_array().unwrap().len(), 1);
+    let other_library = request(&app, Some(&other), "GET", "/api/library/items", None, 200).await;
+    assert!(other_library["items"].as_array().unwrap().is_empty());
+    request(
+        &app,
+        Some(&other),
+        "PATCH",
+        &format!("/api/library/items/{library_item_id}"),
+        Some(json!({"name":"stolen"})),
+        404,
+    )
+    .await;
+    sqlx::query("INSERT INTO board_members(id,board_id,user_id,role) VALUES('library-viewer','library-source','guest','VIEWER')")
+        .execute(&db)
+        .await
+        .unwrap();
+    request(
+        &app,
+        Some(&guest),
+        "POST",
+        "/api/library/items",
+        Some(json!({
+            "name":"Viewer shape",
+            "sourceBoardId":"library-source",
+            "elements":[library_element]
+        })),
+        403,
+    )
+    .await;
     for query in [
         "limit=0",
         "limit=101",
@@ -526,7 +608,7 @@ async fn dashboard_http_flows_and_authorization() {
         .unwrap();
     assert_eq!(favorites_after_removal, favorites_before);
     request(&app, Some(&free), "GET", "/api/collections", None, 403).await;
-    request(&app, Some(&expired), "GET", "/api/collections", None, 403).await;
+    request(&app, Some(&expired), "GET", "/api/collections", None, 200).await;
     let collection = request(
         &app,
         Some(&pro),
@@ -551,6 +633,351 @@ async fn dashboard_http_flows_and_authorization() {
     let collection_path = format!("/api/collections/{collection_id}");
     let collection_board_path = format!("{collection_path}/boards/{pro_board_id}");
     request(&app, Some(&pro), "PUT", &collection_board_path, None, 200).await;
+    let empty_collection_library = request(
+        &app,
+        Some(&pro),
+        "GET",
+        &format!("/api/collections/{collection_id}/library"),
+        None,
+        200,
+    )
+    .await;
+    assert!(empty_collection_library["library"].is_null());
+    request(
+        &app,
+        Some(&other),
+        "GET",
+        &format!("/api/collections/{collection_id}/library"),
+        None,
+        404,
+    )
+    .await;
+    let mut pro_library_element = library_element.clone();
+    pro_library_element["id"] = json!("pro-owned-shape-id");
+    let collection_item = request(
+        &app,
+        Some(&pro),
+        "POST",
+        &format!("/api/collections/{collection_id}/library/items"),
+        Some(json!({
+            "name":"Collection shape",
+            "sourceBoardId":pro_board_id,
+            "elements":[pro_library_element.clone()]
+        })),
+        201,
+    )
+    .await;
+    assert_eq!(collection_item["scope"], "collection");
+    assert_eq!(collection_item["elementCount"], 1);
+    assert!(collection_item["libraryId"].is_string());
+    assert!(collection_item["contentHash"].is_string());
+    let mut same_collection_content = pro_library_element.clone();
+    same_collection_content["id"] = json!("different-pro-shape-id");
+    let same_scope_duplicate = request(
+        &app,
+        Some(&pro),
+        "POST",
+        &format!("/api/collections/{collection_id}/library/items"),
+        Some(json!({
+            "name":"Same collection shape, new IDs",
+            "sourceBoardId":pro_board_id,
+            "elements":[same_collection_content.clone()]
+        })),
+        409,
+    )
+    .await;
+    assert_eq!(same_scope_duplicate["code"], "LIBRARY_ITEM_DUPLICATE");
+    assert_eq!(
+        same_scope_duplicate["existingItem"]["id"],
+        collection_item["id"]
+    );
+    assert_eq!(same_scope_duplicate["source"]["scope"], "collection");
+    assert_eq!(
+        same_scope_duplicate["source"]["collectionId"],
+        collection_id
+    );
+    let asset_id = "collection-library-asset";
+    sqlx::query(
+        "INSERT INTO assets(id,mime_type,width,height,byte_size,storage_path,owner_id,board_id,status,completed_at)
+         VALUES($1,'image/png',1,1,100,'local/test-asset','pro',$2,'complete',now())",
+    )
+    .bind(asset_id)
+    .bind(pro_board_id)
+    .execute(&db)
+    .await
+    .unwrap();
+    let collection_item_two = request(
+        &app,
+        Some(&pro),
+        "POST",
+        &format!("/api/collections/{collection_id}/library/items"),
+        Some(json!({
+            "name":"Second collection shape",
+            "sourceBoardId":pro_board_id,
+            "elements":[json!({
+                "id":"library-shape-two",
+                "type":"rectangle",
+                "x":0.0,"y":0.0,"width":50.0,"height":40.0,"rotation":0.0,
+                "strokeColor":"#1e1e1e","backgroundColor":"transparent",
+                "strokeWidth":2.0,"opacity":1.0,"fillStyle":"solid",
+                "strokeStyle":"solid","roughness":0.0,"seed":2.0,
+                "groupId":null,"zIndex":0.0,"locked":false
+            })]
+        })),
+        201,
+    )
+    .await;
+    sqlx::query("INSERT INTO library_item_assets(library_item_id,asset_id) VALUES($1,$2)")
+        .bind(collection_item["id"].as_str().unwrap())
+        .bind(asset_id)
+        .execute(&db)
+        .await
+        .unwrap();
+    let invalid_scope = sqlx::query(
+        "INSERT INTO libraries(id,owner_id,scope,collection_id)
+         VALUES('invalid-scope-library','pro','collection',NULL)",
+    )
+    .execute(&db)
+    .await;
+    assert!(invalid_scope.is_err());
+    let collection_library = request(
+        &app,
+        Some(&pro),
+        "GET",
+        &format!("/api/collections/{collection_id}/library?limit=1"),
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(collection_library["items"].as_array().unwrap().len(), 1);
+    assert!(collection_library["library"]["id"].is_string());
+    assert_eq!(collection_library["library"]["collectionName"], "Research");
+    assert!(collection_library["etag"].is_string());
+    let next_collection_page = request(
+        &app,
+        Some(&pro),
+        "GET",
+        &format!(
+            "/api/collections/{collection_id}/library?limit=1&cursor={}",
+            collection_library["nextCursor"].as_str().unwrap()
+        ),
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(next_collection_page["items"].as_array().unwrap().len(), 1);
+    let duplicate_collection_library = sqlx::query(
+        "INSERT INTO libraries(id,owner_id,scope,collection_id)
+         VALUES('duplicate-collection-library','pro','collection',$1)",
+    )
+    .bind(collection_id)
+    .execute(&db)
+    .await;
+    assert!(duplicate_collection_library.is_err());
+    let wrong_collection_owner = sqlx::query(
+        "INSERT INTO libraries(id,owner_id,scope,collection_id)
+         VALUES('wrong-collection-owner-library','other','collection',$1)",
+    )
+    .bind(collection_id)
+    .execute(&db)
+    .await;
+    assert!(wrong_collection_owner.is_err());
+    let board_libraries = request(
+        &app,
+        Some(&pro),
+        "GET",
+        &format!("/api/boards/{pro_board_id}/libraries"),
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(board_libraries["libraries"].as_array().unwrap().len(), 2);
+    assert_eq!(board_libraries["libraries"][0]["scope"], "user");
+    assert_eq!(board_libraries["libraries"][1]["scope"], "collection");
+    assert!(board_libraries["libraries"][1]["id"].is_string());
+    assert_eq!(board_libraries["libraries"][1]["locked"], false);
+    assert_eq!(
+        board_libraries["libraries"][1]["collectionId"],
+        collection_id
+    );
+    assert_eq!(
+        board_libraries["libraries"][1]["collectionName"],
+        "Research"
+    );
+    request(
+        &app,
+        Some(&other),
+        "POST",
+        &format!("/api/collections/{collection_id}/library/items"),
+        Some(json!({
+            "name":"Unauthorized",
+            "sourceBoardId":pro_board_id,
+            "elements":[library_element.clone()]
+        })),
+        404,
+    )
+    .await;
+    let copied_item = request(
+        &app,
+        Some(&pro),
+        "POST",
+        &format!("/api/library/items/{}/copy", collection_item["id"]),
+        Some(json!({"target":"personal"})),
+        201,
+    )
+    .await;
+    assert_eq!(copied_item["scope"], "user");
+    same_collection_content["id"] = json!("third-pro-shape-id");
+    let cross_scope_duplicate = request(
+        &app,
+        Some(&pro),
+        "POST",
+        "/api/library/items",
+        Some(json!({
+            "name":"Same shape in another scope",
+            "sourceBoardId":pro_board_id,
+            "elements":[same_collection_content]
+        })),
+        409,
+    )
+    .await;
+    assert_eq!(cross_scope_duplicate["code"], "LIBRARY_ITEM_DUPLICATE");
+    assert_eq!(
+        cross_scope_duplicate["existingItem"]["id"],
+        copied_item["id"]
+    );
+    assert_eq!(cross_scope_duplicate["source"]["scope"], "user");
+    assert_eq!(
+        cross_scope_duplicate["source"]["libraryId"],
+        copied_item["libraryId"]
+    );
+    let copied_asset_link: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM library_item_assets
+         WHERE library_item_id=$1 AND asset_id=$2)",
+    )
+    .bind(copied_item["id"].as_str().unwrap())
+    .bind(asset_id)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert!(copied_asset_link);
+    let duplicate = request(
+        &app,
+        Some(&pro),
+        "POST",
+        &format!("{collection_path}/duplicate"),
+        Some(json!({})),
+        201,
+    )
+    .await;
+    let duplicate_id = duplicate["id"].as_str().unwrap();
+    let duplicated_library = request(
+        &app,
+        Some(&pro),
+        "GET",
+        &format!("/api/collections/{duplicate_id}/library"),
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(duplicated_library["items"].as_array().unwrap().len(), 2);
+    let duplicate_asset_link: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM library_item_assets asset_link
+         JOIN library_items item ON item.id=asset_link.library_item_id
+         JOIN libraries library ON library.id=item.library_id
+         WHERE library.collection_id=$1 AND asset_link.asset_id=$2)",
+    )
+    .bind(duplicate_id)
+    .bind(asset_id)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert!(duplicate_asset_link);
+    request(
+        &app,
+        Some(&pro),
+        "DELETE",
+        &format!("/api/collections/{duplicate_id}"),
+        None,
+        200,
+    )
+    .await;
+    request(
+        &app,
+        Some(&pro),
+        "DELETE",
+        &format!("/api/trash/collections/{duplicate_id}"),
+        None,
+        200,
+    )
+    .await;
+    let deleted_duplicate_library: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM libraries WHERE collection_id=$1")
+            .bind(duplicate_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(deleted_duplicate_library, 0);
+    let second_collection = request(
+        &app,
+        Some(&pro),
+        "POST",
+        "/api/collections",
+        Some(json!({"name":"Research two"})),
+        201,
+    )
+    .await;
+    let second_collection_id = second_collection["id"].as_str().unwrap();
+    request(
+        &app,
+        Some(&pro),
+        "PUT",
+        &format!("/api/collections/{second_collection_id}/boards/{pro_board_id}"),
+        None,
+        200,
+    )
+    .await;
+    let multiple_libraries = request(
+        &app,
+        Some(&pro),
+        "GET",
+        &format!("/api/boards/{pro_board_id}/libraries"),
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(multiple_libraries["libraries"].as_array().unwrap().len(), 3);
+    let moved_item = request(
+        &app,
+        Some(&pro),
+        "POST",
+        &format!("/api/library/items/{}/move", copied_item["id"]),
+        Some(json!({"target":{"collectionId":second_collection_id}})),
+        200,
+    )
+    .await;
+    assert_eq!(moved_item["scope"], "collection");
+    request(
+        &app,
+        Some(&pro),
+        "POST",
+        &format!("/api/collections/{collection_id}/library/reorder"),
+        Some(json!({
+            "itemId":collection_item_two["id"],
+            "position":0
+        })),
+        200,
+    )
+    .await;
+    request(
+        &app,
+        Some(&pro),
+        "POST",
+        &format!("/api/collections/{collection_id}/library/reorder"),
+        Some(json!({"itemIds":[collection_item["id"],collection_item_two["id"]]})),
+        200,
+    )
+    .await;
     let collection_boards = request(
         &app,
         Some(&pro),
@@ -581,6 +1008,116 @@ async fn dashboard_http_flows_and_authorization() {
     )
     .await;
     request(&app, Some(&pro), "DELETE", &collection_path, None, 200).await;
+    let trashed_collections = request(
+        &app,
+        Some(&pro),
+        "GET",
+        "/api/collections?scope=trash",
+        None,
+        200,
+    )
+    .await;
+    assert!(trashed_collections["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == collection_id));
+    let still_member: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM private_collection_boards
+         WHERE collection_id=$1 AND board_id=$2)",
+    )
+    .bind(collection_id)
+    .bind(pro_board_id)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert!(still_member);
+    request(
+        &app,
+        Some(&pro),
+        "POST",
+        &format!("{collection_path}/restore"),
+        None,
+        200,
+    )
+    .await;
+    sqlx::query("UPDATE users SET plan='free', plan_expires_at=NULL WHERE id='pro'")
+        .execute(&db)
+        .await
+        .unwrap();
+    let free_locked_libraries = request(
+        &app,
+        Some(&pro),
+        "GET",
+        &format!("/api/boards/{pro_board_id}/libraries"),
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(
+        free_locked_libraries["libraries"][1]["readonlyReason"],
+        "upgrade_required"
+    );
+    assert_eq!(free_locked_libraries["libraries"][1]["locked"], true);
+    assert!(free_locked_libraries["libraries"][1]["collectionId"].is_string());
+    assert!(free_locked_libraries["libraries"][1]["etag"].is_null());
+    sqlx::query(
+        "UPDATE users SET plan='pro', plan_expires_at=now()-interval '1 day' WHERE id='pro'",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    let lapsed_libraries = request(
+        &app,
+        Some(&pro),
+        "GET",
+        &format!("/api/boards/{pro_board_id}/libraries"),
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(
+        lapsed_libraries["libraries"][1]["readonlyReason"],
+        "plan_lapsed"
+    );
+    let lapsed_read = request(
+        &app,
+        Some(&pro),
+        "GET",
+        &format!("/api/collections/{collection_id}/library"),
+        None,
+        200,
+    )
+    .await;
+    assert_eq!(lapsed_read["readonlyReason"], "plan_lapsed");
+    request(
+        &app,
+        Some(&pro),
+        "PATCH",
+        &format!(
+            "/api/collections/{collection_id}/library/items/{}",
+            collection_item["id"]
+        ),
+        Some(json!({"name":"cannot edit"})),
+        403,
+    )
+    .await;
+    let lapsed_copy = request(
+        &app,
+        Some(&pro),
+        "POST",
+        &format!("/api/library/items/{}/copy", collection_item["id"]),
+        Some(json!({"target":"personal"})),
+        201,
+    )
+    .await;
+    assert_eq!(lapsed_copy["scope"], "user");
+    sqlx::query(
+        "UPDATE users SET plan='pro', plan_expires_at=now()+interval '30 days' WHERE id='pro'",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM boards WHERE id=$1")
             .bind(pro_board_id)

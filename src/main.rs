@@ -255,6 +255,7 @@ async fn main() {
         .merge(openapi::swagger_ui())
         .merge(routes::dashboard::router())
         .merge(routes::editor::router())
+        .merge(routes::library::router())
         .merge(routes::notifications::router())
         .merge(routes::public_links::router())
         .layer(cors)

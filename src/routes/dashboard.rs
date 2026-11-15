@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use tower_cookies::Cookies;
+use utoipa::ToSchema;
 use validator::ValidateEmail;
 
 use crate::{
@@ -53,6 +54,22 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/collections/{id}",
             axum::routing::delete(delete_private_collection),
+        )
+        .route(
+            "/api/collections/{id}/restore",
+            post(restore_private_collection),
+        )
+        .route(
+            "/api/trash/collections/{id}",
+            axum::routing::delete(permanently_delete_private_collection),
+        )
+        .route(
+            "/api/trash/collections/{id}/restore",
+            post(restore_private_collection),
+        )
+        .route(
+            "/api/collections/{id}/duplicate",
+            post(duplicate_private_collection),
         )
         .route(
             "/api/collections/{collection_id}/boards/{board_id}",
@@ -139,12 +156,17 @@ struct CachedDashboardCounts {
     trash: i64,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize, FromRow, ToSchema)]
 #[serde(rename_all = "camelCase")]
-struct PrivateCollectionSummary {
+pub struct PrivateCollectionSummary {
     id: String,
     name: String,
     board_count: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PrivateCollectionsResponse {
+    items: Vec<PrivateCollectionSummary>,
 }
 
 #[derive(Serialize)]
@@ -310,10 +332,28 @@ struct NameInput {
     name: String,
 }
 
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PrivateCollectionInput {
+    name: String,
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DuplicateCollectionInput {
+    name: Option<String>,
+    #[serde(default = "default_true")]
+    copy_library: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PrivateCollectionInput {
-    name: String,
+pub struct PrivateCollectionQuery {
+    scope: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -634,8 +674,7 @@ const BOARD_SELECT: &str = "SELECT b.id,b.name,b.owner_id,owner.name AS owner_na
     FROM boards b JOIN users owner ON owner.id=b.owner_id
     LEFT JOIN board_members m ON m.board_id=b.id AND m.user_id=$1
     LEFT JOIN workspace_members wm ON wm.workspace_id=b.workspace_id AND wm.user_id=$1
-    LEFT JOIN board_favorites favorite ON favorite.board_id=b.id AND favorite.user_id=$1
-    LEFT JOIN private_collection_boards cboard ON cboard.board_id=b.id AND cboard.owner_id=$1";
+    LEFT JOIN board_favorites favorite ON favorite.board_id=b.id AND favorite.user_id=$1";
 
 async fn board_summary(db: &PgPool, board_id: &str, user_id: &str) -> AppResult<BoardSummary> {
     authz::require_board_role(db, board_id, user_id, BoardRole::Viewer).await?;
@@ -692,7 +731,7 @@ async fn list_boards(
         ));
     }
     if let Some(collection_id) = collection_id {
-        require_private_collections_pro(&state.db, &user.id).await?;
+        require_private_collections_read(&state.db, &user.id).await?;
         require_owned_collection(&state.db, collection_id, &user.id).await?;
     }
     let user_is_pro = if scope == "favorites" || workspace.is_some() {
@@ -740,7 +779,12 @@ async fn list_boards(
     };
     let mut items: Vec<BoardSummary> = sqlx::query_as(&format!(
         "{BOARD_SELECT} WHERE {condition}
-        AND ($7::text IS NULL OR (b.owner_id=$1 AND cboard.collection_id=$7))
+        AND ($7::text IS NULL OR (b.owner_id=$1 AND EXISTS(
+            SELECT 1 FROM private_collection_boards cb
+            JOIN private_collections collection ON collection.id=cb.collection_id
+            WHERE cb.board_id=b.id AND cb.owner_id=$1
+              AND cb.collection_id=$7 AND collection.deleted_at IS NULL
+        )))
         AND (b.owner_id=$1 OR m.id IS NOT NULL OR ($8::boolean AND wm.user_id=$1))
         AND strpos(lower(b.name),lower($3))>0
         AND ($4::timestamptz IS NULL OR (b.updated_at,b.id)<($4,$5))
@@ -1138,13 +1182,23 @@ async fn require_private_collections_pro(db: &PgPool, user_id: &str) -> AppResul
     Ok(())
 }
 
+async fn require_private_collections_read(db: &PgPool, user_id: &str) -> AppResult<()> {
+    if billing::get_billing_state(db, user_id).await?.status == BillingStatus::Free {
+        return Err(AppError::Forbidden(
+            "Private collections require a paid plan.".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn require_owned_collection(
     db: &PgPool,
     collection_id: &str,
     user_id: &str,
 ) -> AppResult<()> {
     let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM private_collections WHERE id=$1 AND owner_id=$2)",
+        "SELECT EXISTS(SELECT 1 FROM private_collections
+         WHERE id=$1 AND owner_id=$2 AND deleted_at IS NULL)",
     )
     .bind(collection_id)
     .bind(user_id)
@@ -1156,28 +1210,62 @@ async fn require_owned_collection(
     Ok(())
 }
 
-async fn list_private_collections(
+#[utoipa::path(
+    get,
+    path = "/api/collections",
+    tag = "collections",
+    params(("scope" = Option<String>, Query, description = "active (default) or trash")),
+    responses(
+        (status = 200, description = "Owned private collections", body = PrivateCollectionsResponse),
+        (status = 401, description = "Not signed in"),
+        (status = 403, description = "Collection library unavailable to this plan")
+    )
+)]
+pub async fn list_private_collections(
     State(state): State<AppState>,
     cookies: Cookies,
-) -> AppResult<Json<Items<PrivateCollectionSummary>>> {
+    query: Result<Query<PrivateCollectionQuery>, axum::extract::rejection::QueryRejection>,
+) -> AppResult<Json<PrivateCollectionsResponse>> {
     let user = session::require_current_user(&cookies, &state).await?;
-    require_private_collections_pro(&state.db, &user.id).await?;
-    let items = sqlx::query_as::<_, PrivateCollectionSummary>(
-        "SELECT c.id,c.name,count(cb.board_id)::bigint AS board_count
+    require_private_collections_read(&state.db, &user.id).await?;
+    let Query(query) =
+        query.map_err(|_| AppError::BadRequest("Invalid collection query parameters.".into()))?;
+    let scope = query.scope.as_deref().unwrap_or("active");
+    let deleted_filter = match scope {
+        "active" => "c.deleted_at IS NULL",
+        "trash" => "c.deleted_at IS NOT NULL",
+        _ => {
+            return Err(AppError::BadRequest(
+                "scope must be active or trash.".into(),
+            ))
+        }
+    };
+    let items = sqlx::query_as::<_, PrivateCollectionSummary>(&format!(
+        "SELECT c.id,c.name,count(DISTINCT cb.board_id)::bigint AS board_count
          FROM private_collections c
          LEFT JOIN private_collection_boards cb
            ON cb.collection_id=c.id AND cb.owner_id=c.owner_id
-         WHERE c.owner_id=$1
+         WHERE c.owner_id=$1 AND {deleted_filter}
          GROUP BY c.id
-         ORDER BY c.created_at,c.id",
-    )
+         ORDER BY c.created_at,c.id"
+    ))
     .bind(&user.id)
     .fetch_all(&state.db)
     .await?;
-    Ok(Json(Items { items }))
+    Ok(Json(PrivateCollectionsResponse { items }))
 }
 
-async fn create_private_collection(
+#[utoipa::path(
+    post,
+    path = "/api/collections",
+    tag = "collections",
+    request_body = PrivateCollectionInput,
+    responses(
+        (status = 201, description = "Private collection created", body = PrivateCollectionSummary),
+        (status = 403, description = "Active paid plan required")
+    )
+)]
+pub async fn create_private_collection(
     State(state): State<AppState>,
     cookies: Cookies,
     AppJson(input): AppJson<PrivateCollectionInput>,
@@ -1201,22 +1289,178 @@ async fn create_private_collection(
     Ok((StatusCode::CREATED, Json(collection)))
 }
 
-async fn delete_private_collection(
+#[utoipa::path(
+    delete,
+    path = "/api/collections/{id}",
+    tag = "collections",
+    params(("id" = String, Path, description = "Owned private collection ID")),
+    responses(
+        (status = 200, description = "Collection moved to Trash"),
+        (status = 404, description = "Collection not found")
+    )
+)]
+pub async fn delete_private_collection(
     State(state): State<AppState>,
     cookies: Cookies,
     Path(collection_id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let user = session::require_current_user(&cookies, &state).await?;
     require_private_collections_pro(&state.db, &user.id).await?;
-    let result = sqlx::query("DELETE FROM private_collections WHERE id=$1 AND owner_id=$2")
-        .bind(collection_id)
-        .bind(&user.id)
-        .execute(&state.db)
-        .await?;
+    let result = sqlx::query(
+        "UPDATE private_collections SET deleted_at=now()
+         WHERE id=$1 AND owner_id=$2 AND deleted_at IS NULL",
+    )
+    .bind(collection_id)
+    .bind(&user.id)
+    .execute(&state.db)
+    .await?;
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("Collection not found".into()));
     }
     Ok(Json(json!({"success":true})))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/collections/{id}/restore",
+    tag = "collections",
+    params(("id" = String, Path, description = "Owned collection in Trash")),
+    responses(
+        (status = 200, description = "Collection restored"),
+        (status = 404, description = "Collection not found")
+    )
+)]
+pub async fn restore_private_collection(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Path(collection_id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let user = session::require_current_user(&cookies, &state).await?;
+    require_private_collections_pro(&state.db, &user.id).await?;
+    let result = sqlx::query(
+        "UPDATE private_collections SET deleted_at=NULL
+         WHERE id=$1 AND owner_id=$2 AND deleted_at IS NOT NULL",
+    )
+    .bind(collection_id)
+    .bind(&user.id)
+    .execute(&state.db)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound("Collection in Trash not found.".into()));
+    }
+    Ok(Json(json!({"success":true})))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/trash/collections/{id}",
+    tag = "collections",
+    params(("id" = String, Path, description = "Owned collection in Trash")),
+    responses(
+        (status = 200, description = "Collection permanently deleted"),
+        (status = 404, description = "Collection not found")
+    )
+)]
+pub async fn permanently_delete_private_collection(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Path(collection_id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let user = session::require_current_user(&cookies, &state).await?;
+    let result = sqlx::query(
+        "DELETE FROM private_collections
+         WHERE id=$1 AND owner_id=$2 AND deleted_at IS NOT NULL",
+    )
+    .bind(collection_id)
+    .bind(&user.id)
+    .execute(&state.db)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound("Collection in Trash not found.".into()));
+    }
+    Ok(Json(json!({"success":true})))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/collections/{id}/duplicate",
+    tag = "collections",
+    params(("id" = String, Path, description = "Owned private collection ID")),
+    request_body = DuplicateCollectionInput,
+    responses(
+        (status = 201, description = "Collection duplicated", body = PrivateCollectionSummary),
+        (status = 404, description = "Collection not found")
+    )
+)]
+pub async fn duplicate_private_collection(
+    State(state): State<AppState>,
+    cookies: Cookies,
+    Path(collection_id): Path<String>,
+    AppJson(input): AppJson<DuplicateCollectionInput>,
+) -> AppResult<(StatusCode, Json<PrivateCollectionSummary>)> {
+    let user = session::require_current_user(&cookies, &state).await?;
+    require_private_collections_pro(&state.db, &user.id).await?;
+    require_owned_collection(&state.db, &collection_id, &user.id).await?;
+    let source_name: String =
+        sqlx::query_scalar("SELECT name FROM private_collections WHERE id=$1 AND owner_id=$2")
+            .bind(&collection_id)
+            .bind(&user.id)
+            .fetch_one(&state.db)
+            .await?;
+    let copy_name = input.name.unwrap_or_else(|| {
+        format!(
+            "{} (copy)",
+            source_name.chars().take(33).collect::<String>()
+        )
+    });
+    let copy_name = name(&copy_name, 40)?;
+    let new_collection_id = id();
+    let mut tx = state.db.begin().await?;
+    sqlx::query("INSERT INTO private_collections(id,owner_id,name) VALUES($1,$2,$3)")
+        .bind(&new_collection_id)
+        .bind(&user.id)
+        .bind(copy_name)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO private_collection_boards(owner_id,board_id,collection_id)
+         SELECT owner_id,board_id,$2 FROM private_collection_boards
+         WHERE owner_id=$1 AND collection_id=$3
+         ON CONFLICT(owner_id,board_id,collection_id) DO NOTHING",
+    )
+    .bind(&user.id)
+    .bind(&new_collection_id)
+    .bind(&collection_id)
+    .execute(&mut *tx)
+    .await?;
+    if input.copy_library {
+        super::library::duplicate_library_to_collection(
+            &mut tx,
+            &user.id,
+            &collection_id,
+            &new_collection_id,
+        )
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO library_audit_events(actor_id,event,library_id,item_count)
+         VALUES($1,'collection_duplicated',$2,0)",
+    )
+    .bind(&user.id)
+    .bind(&collection_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let collection = sqlx::query_as::<_, PrivateCollectionSummary>(
+        "SELECT c.id,c.name,count(DISTINCT cb.board_id)::bigint AS board_count
+         FROM private_collections c
+         LEFT JOIN private_collection_boards cb ON cb.collection_id=c.id
+         WHERE c.id=$1 GROUP BY c.id",
+    )
+    .bind(new_collection_id)
+    .fetch_one(&state.db)
+    .await?;
+    Ok((StatusCode::CREATED, Json(collection)))
 }
 
 async fn add_board_to_collection(
@@ -1231,7 +1475,7 @@ async fn add_board_to_collection(
     sqlx::query(
         "INSERT INTO private_collection_boards(owner_id,board_id,collection_id)
          VALUES($1,$2,$3)
-         ON CONFLICT(owner_id,board_id) DO UPDATE SET collection_id=EXCLUDED.collection_id",
+         ON CONFLICT(owner_id,board_id,collection_id) DO NOTHING",
     )
     .bind(&user.id)
     .bind(&board_id)

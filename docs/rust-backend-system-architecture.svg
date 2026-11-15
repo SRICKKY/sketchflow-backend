@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="920" viewBox="0 0 1440 920" role="img" aria-labelledby="title description">
+  <title id="title">SketchFlow Rust backend system architecture</title>
+  <desc id="description">Architecture showing browser and web UI connecting through Nginx to the Rust Axum API on EC2, with PostgreSQL, Redis or Valkey, S3, OAuth and payment providers, plus GitHub Actions release delivery.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#52627a"/>
+    </marker>
+    <marker id="arrow-dashed" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#718096"/>
+    </marker>
+    <style>
+      .bg { fill: #f5f7fb; }
+      .title { font: 700 30px Arial, sans-serif; fill: #172033; }
+      .subtitle { font: 15px Arial, sans-serif; fill: #52627a; }
+      .group { fill: #eef3fb; stroke: #8ea1bd; stroke-width: 2; }
+      .box { fill: #ffffff; stroke: #6d7f99; stroke-width: 2; rx: 14; }
+      .primary { fill: #e6f4ff; stroke: #2782b8; }
+      .storage { fill: #eaf8ef; stroke: #31845b; }
+      .provider { fill: #fff5e6; stroke: #bd7a20; }
+      .delivery { fill: #f2ecff; stroke: #7758a6; }
+      .box-title { font: 700 17px Arial, sans-serif; fill: #172033; text-anchor: middle; }
+      .box-text { font: 14px Arial, sans-serif; fill: #39475d; text-anchor: middle; }
+      .edge { stroke: #52627a; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+      .edge-dashed { stroke: #718096; stroke-width: 2; stroke-dasharray: 8 7; fill: none; marker-end: url(#arrow-dashed); }
+      .edge-label { font: 13px Arial, sans-serif; fill: #34445b; text-anchor: middle; }
+      .note { font: 13px Arial, sans-serif; fill: #52627a; }
+    </style>
+  </defs>
+  <rect class="bg" x="0" y="0" width="1440" height="920"/>
+  <text class="title" x="56" y="58">SketchFlow · Rust Backend System Architecture</text>
+  <text class="subtitle" x="56" y="86">Current production model: EC2 + systemd + Nginx; external PostgreSQL, Valkey/Redis, and S3-compatible storage</text>
+
+  <rect class="group" x="410" y="140" width="560" height="590" rx="22"/>
+  <text class="box-title" x="690" y="174">AWS · EC2 Ubuntu x86_64</text>
+
+  <rect class="box" x="70" y="215" width="240" height="100"/>
+  <text class="box-title" x="190" y="253">User's Browser</text>
+  <text class="box-text" x="190" y="278">HTTPS · session cookie · WSS</text>
+
+  <rect class="box primary" x="70" y="390" width="240" height="110"/>
+  <text class="box-title" x="190" y="428">SketchFlow Web UI</text>
+  <text class="box-text" x="190" y="453">React / current Next.js client</text>
+  <text class="box-text" x="190" y="475">REST requests + collaboration socket</text>
+
+  <rect class="box provider" x="70" y="625" width="240" height="90"/>
+  <text class="box-title" x="190" y="662">GitHub Actions</text>
+  <text class="box-text" x="190" y="686">Builds Linux release artifact</text>
+
+  <rect class="box" x="465" y="220" width="450" height="85"/>
+  <text class="box-title" x="690" y="255">Nginx Reverse Proxy</text>
+  <text class="box-text" x="690" y="280">TLS termination · REST + WebSocket upgrade</text>
+
+  <rect class="box delivery" x="465" y="355" width="210" height="82"/>
+  <text class="box-title" x="570" y="389">systemd</text>
+  <text class="box-text" x="570" y="414">sketchflow-backend.service</text>
+
+  <rect class="box primary" x="705" y="355" width="210" height="82"/>
+  <text class="box-title" x="810" y="389">Rust API</text>
+  <text class="box-text" x="810" y="414">Axum · Tokio · SQLx</text>
+
+  <rect class="box primary" x="465" y="500" width="450" height="82"/>
+  <text class="box-title" x="690" y="534">API Domains</text>
+  <text class="box-text" x="690" y="559">Auth · boards · collaboration · comments · billing · uploads</text>
+
+  <rect class="box" x="465" y="625" width="450" height="70"/>
+  <text class="box-title" x="690" y="657">Background upload cleanup</text>
+  <text class="box-text" x="690" y="679">Periodic task in the API process</text>
+
+  <rect class="box storage" x="1090" y="175" width="285" height="105"/>
+  <text class="box-title" x="1232" y="213">PostgreSQL</text>
+  <text class="box-text" x="1232" y="238">Durable relational state</text>
+  <text class="box-text" x="1232" y="260">Migrations applied at startup</text>
+
+  <rect class="box storage" x="1090" y="335" width="285" height="105"/>
+  <text class="box-title" x="1232" y="373">Valkey / Redis</text>
+  <text class="box-text" x="1232" y="398">Collaboration Pub/Sub</text>
+  <text class="box-text" x="1232" y="420">Optional bounded JSON caches</text>
+
+  <rect class="box storage" x="1090" y="495" width="285" height="105"/>
+  <text class="box-title" x="1232" y="533">Amazon S3</text>
+  <text class="box-text" x="1232" y="558">Image/avatar bytes</text>
+  <text class="box-text" x="1232" y="580">Presigned direct transfers</text>
+
+  <rect class="box provider" x="1090" y="655" width="285" height="90"/>
+  <text class="box-title" x="1232" y="690">External Providers</text>
+  <text class="box-text" x="1232" y="716">Google / GitHub OAuth · Paddle / Razorpay</text>
+
+  <path class="edge" d="M190 315 L190 382"/>
+  <text class="edge-label" x="245" y="352">uses</text>
+  <path class="edge" d="M310 445 C365 445 385 262 457 262"/>
+  <text class="edge-label" x="375" y="350">HTTPS / WSS</text>
+  <path class="edge" d="M675 396 L697 396"/>
+  <path class="edge" d="M810 437 L810 492"/>
+  <path class="edge" d="M690 582 L690 617"/>
+  <path class="edge" d="M915 394 C1000 394 1010 227 1082 227"/>
+  <text class="edge-label" x="1008" y="296">SQLx</text>
+  <path class="edge" d="M915 408 C1000 408 1015 387 1082 387"/>
+  <text class="edge-label" x="1002" y="378">TLS Redis protocol</text>
+  <path class="edge" d="M915 530 C1010 530 1015 548 1082 548"/>
+  <text class="edge-label" x="1000" y="524">S3 API</text>
+  <path class="edge" d="M915 552 C1008 552 1013 690 1082 690"/>
+  <text class="edge-label" x="1004" y="631">OAuth / payments</text>
+  <path class="edge-dashed" d="M310 472 C770 470 900 570 1082 570"/>
+  <text class="edge-label" x="956" y="584">presigned upload / download</text>
+  <path class="edge-dashed" d="M310 672 C370 672 390 396 457 396"/>
+  <text class="edge-label" x="390" y="610">manual release deploy</text>
+
+  <text class="note" x="56" y="805">Port 8080 stays private on EC2; Nginx proxies to 127.0.0.1:8080.</text>
+  <text class="note" x="56" y="829">Redis/Valkey is shared by API instances for WebSocket event fan-out and cache entries.</text>
+  <text class="note" x="56" y="853">The build workflow publishes an artifact; EC2 deployment is currently manual.</text>
+</svg>

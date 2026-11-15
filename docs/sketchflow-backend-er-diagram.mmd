@@ -1,0 +1,218 @@
+erDiagram
+    USERS ||--o{ SESSIONS : has
+    USERS ||--o{ ACCOUNTS : has
+    USERS ||--o{ SUBSCRIPTIONS : has
+    USERS ||--o{ INVOICES : receives
+    SUBSCRIPTIONS o|--o{ INVOICES : billed_for
+
+    USERS ||--o{ BOARDS : owns
+    USERS ||--o{ BOARD_MEMBERS : joins
+    BOARDS ||--o{ BOARD_MEMBERS : has
+    BOARDS ||--o{ BOARD_ELEMENTS : contains
+
+    USERS ||--o{ WORKSPACES : creates
+    USERS ||--o{ WORKSPACE_MEMBERS : joins
+    WORKSPACES ||--o{ WORKSPACE_MEMBERS : has
+
+    BOARDS ||--o| BOARD_COLLABORATION_STATE : tracks
+    BOARDS ||--o{ BOARD_OPERATIONS : records
+    USERS ||--o{ BOARD_OPERATIONS : performs
+
+    USERS ||--o{ BOARD_TEMPLATES : creates
+    BOARDS ||--o{ BOARD_VERSIONS : versions
+    USERS ||--o{ BOARD_VERSIONS : creates
+
+    BOARDS ||--o{ BOARD_COMMENTS : has
+    USERS ||--o{ BOARD_COMMENTS : writes
+    BOARD_COMMENTS o|--o{ BOARD_COMMENTS : replies_to
+    BOARD_COMMENTS ||--o{ COMMENT_REACTIONS : receives
+    USERS ||--o{ COMMENT_REACTIONS : reacts
+
+    USERS ||--o{ NOTIFICATIONS : recipient
+    USERS o|--o{ NOTIFICATIONS : actor
+    BOARDS o|--o{ NOTIFICATIONS : about
+    WORKSPACES o|--o{ NOTIFICATIONS : about
+    BOARD_COMMENTS o|--o{ NOTIFICATIONS : about
+
+    USERS ||--o{ PRIVATE_COLLECTIONS : owns
+    PRIVATE_COLLECTIONS ||--o{ PRIVATE_COLLECTION_BOARDS : contains
+    BOARDS ||--o| PRIVATE_COLLECTION_BOARDS : filed_in
+    USERS ||--o{ BOARD_FAVORITES : favorites
+    BOARDS ||--o{ BOARD_FAVORITES : favorited
+    BOARDS ||--o| BOARD_PUBLIC_LINKS : shared_by
+    USERS ||--o{ BOARD_PUBLIC_LINKS : creates
+    USERS ||--o{ LIFETIME_PURCHASES : makes
+
+    USERS {
+        string id PK
+        string email UK
+        string plan
+    }
+
+    SESSIONS {
+        string session_token PK
+        string user_id FK
+        datetime expires
+    }
+
+    ACCOUNTS {
+        string provider PK
+        string provider_account_id PK
+        string user_id FK
+    }
+
+    VERIFICATION_TOKENS {
+        string identifier PK
+        string token PK
+        datetime expires
+    }
+
+    SUBSCRIPTIONS {
+        string id PK
+        string user_id FK
+        string interval
+        string status
+        datetime starts_at
+        datetime expires_at
+    }
+
+    INVOICES {
+        string id PK
+        string user_id FK
+        string subscription_id FK
+        string number UK
+        int amount_minor
+        string status
+    }
+
+    BOARDS {
+        string id PK
+        string owner_id FK
+        string name
+        string workspace_id
+        datetime deleted_at
+    }
+
+    BOARD_MEMBERS {
+        string id PK
+        string board_id FK
+        string user_id FK
+        enum role
+    }
+
+    BOARD_ELEMENTS {
+        string id PK
+        string board_id FK
+        string element_id
+        string type
+        json data
+    }
+
+    WORKSPACES {
+        string id PK
+        string created_by_id FK
+        string name
+        string slug UK
+    }
+
+    WORKSPACE_MEMBERS {
+        string id PK
+        string workspace_id FK
+        string user_id FK
+        enum role
+    }
+
+    BOARD_COLLABORATION_STATE {
+        string board_id PK, FK
+        bigint revision
+    }
+
+    BOARD_OPERATIONS {
+        string id PK
+        string board_id FK
+        string actor_id FK
+        bigint revision
+        json operation
+    }
+
+    BOARD_TEMPLATES {
+        string id PK
+        string created_by_id FK
+        string name
+        json elements
+    }
+
+    BOARD_VERSIONS {
+        string id PK
+        string board_id FK
+        string created_by_id FK
+        string source
+        json elements
+    }
+
+    BOARD_COMMENTS {
+        string id PK
+        string board_id FK
+        string author_id FK
+        string parent_id FK
+        string body
+        bool resolved
+    }
+
+    COMMENT_REACTIONS {
+        string id PK
+        string comment_id FK
+        string user_id FK
+        string emoji
+    }
+
+    NOTIFICATIONS {
+        string id PK
+        string recipient_id FK
+        string actor_id FK
+        enum notification_type
+        string board_id FK
+        string workspace_id FK
+        string comment_id FK
+        json payload
+    }
+
+    ASSETS {
+        string id PK
+        string mime_type
+        string storage_path
+        string status
+        string owner_id
+        string board_id
+    }
+
+    PRIVATE_COLLECTIONS {
+        string id PK
+        string owner_id FK
+        string name
+    }
+
+    PRIVATE_COLLECTION_BOARDS {
+        string owner_id PK
+        string board_id PK
+        string collection_id
+    }
+
+    BOARD_FAVORITES {
+        string user_id PK, FK
+        string board_id PK, FK
+    }
+
+    BOARD_PUBLIC_LINKS {
+        string board_id PK, FK
+        string created_by_id FK
+        string token_nonce
+    }
+
+    LIFETIME_PURCHASES {
+        string id PK
+        string user_id FK
+        string status
+        int amount_minor
+        string gateway
+    }

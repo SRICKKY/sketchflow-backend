@@ -5,6 +5,7 @@ pub mod dashboard;
 pub mod editor;
 pub mod health;
 pub mod invoices;
+pub mod library;
 pub mod notifications;
 pub mod profile;
 pub mod public_links;

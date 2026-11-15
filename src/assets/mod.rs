@@ -260,13 +260,25 @@ pub async fn cleanup_abandoned_uploads(db: &PgPool, config: &AppConfig) -> Resul
               )
               OR (
                   status = 'complete'
-                  AND board_id IS NOT NULL
                   AND completed_at <= now() - interval '24 hours'
+                  AND (
+                      board_id IS NOT NULL
+                      OR EXISTS (
+                          SELECT 1
+                          FROM library_item_assets
+                          WHERE library_item_assets.asset_id = asset.id
+                      )
+                  )
                   AND NOT EXISTS (
                       SELECT 1
                       FROM board_elements
                       WHERE board_elements.type = 'image'
                         AND board_elements.data->>'assetId' = asset.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM library_item_assets
+                      WHERE library_item_assets.asset_id = asset.id
                   )
               )
           )
@@ -327,6 +339,21 @@ pub async fn asset_board_ids(db: &PgPool, asset_id: &str) -> Result<Vec<String>,
         UNION
         SELECT board_id FROM board_elements
         WHERE type = 'image' AND data->>'assetId' = $1
+        "#,
+    )
+    .bind(asset_id)
+    .fetch_all(db)
+    .await?)
+}
+
+pub async fn asset_library_owner_ids(db: &PgPool, asset_id: &str) -> Result<Vec<String>, AppError> {
+    Ok(sqlx::query_scalar(
+        r#"
+        SELECT DISTINCT library.owner_id
+        FROM library_item_assets AS library_asset
+        JOIN library_items AS item ON item.id = library_asset.library_item_id
+        JOIN libraries AS library ON library.id = item.library_id
+        WHERE library_asset.asset_id = $1
         "#,
     )
     .bind(asset_id)
