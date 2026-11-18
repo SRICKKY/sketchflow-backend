@@ -33,6 +33,9 @@ pub struct PaddleCompletion {
     pub interval: String,
     #[serde(rename = "expiresAt")]
     pub expires_at: String,
+    #[serde(rename = "amountMinor")]
+    pub amount_minor: i64,
+    pub currency: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -662,6 +665,8 @@ pub async fn complete_transaction(
         plan: "pro".to_string(),
         interval,
         expires_at: expires_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        amount_minor,
+        currency: transaction.currency_code.trim().to_uppercase(),
     })
 }
 
@@ -718,6 +723,23 @@ mod tests {
         assert_eq!(checkout_amount_to_paddle_minor(50_000), Some(500));
         assert_eq!(checkout_amount_to_paddle_minor(500_000), Some(5_000));
         assert_eq!(checkout_amount_to_paddle_minor(0), None);
+    }
+
+    #[test]
+    fn serializes_verified_payment_amount_for_the_client() {
+        let completion = PaddleCompletion {
+            success: true,
+            status: "completed".to_string(),
+            plan: "pro".to_string(),
+            interval: "year".to_string(),
+            expires_at: "2027-11-18T00:00:00.000Z".to_string(),
+            amount_minor: 4_750,
+            currency: "USD".to_string(),
+        };
+
+        let value = serde_json::to_value(completion).unwrap();
+        assert_eq!(value["amountMinor"], 4_750);
+        assert_eq!(value["currency"], "USD");
     }
 
     #[test]
