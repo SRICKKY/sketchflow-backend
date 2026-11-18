@@ -150,6 +150,51 @@ fn safe_return_to(value: Option<&str>) -> &str {
         .unwrap_or("/dashboard")
 }
 
+fn mcp_authorize_return_url(public_base_url: &str, value: &str) -> Option<Url> {
+    if value.len() > 2048 || value.contains('\\') || value.chars().any(char::is_control) {
+        return None;
+    }
+    let base = Url::parse(public_base_url).ok()?;
+    let url = if value.starts_with('/') && !value.starts_with("//") {
+        base.join(value).ok()?
+    } else {
+        Url::parse(value).ok()?
+    };
+    (matches!(url.scheme(), "http" | "https")
+        && url.origin() == base.origin()
+        && url.path() == "/api/mcp/oauth/authorize"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none())
+    .then_some(url)
+}
+
+fn safe_auth_return_to(public_base_url: &str, value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return "/dashboard".to_owned();
+    };
+    if let Some(url) = mcp_authorize_return_url(public_base_url, value) {
+        return url.into();
+    }
+    if safe_return_to(Some(value)) == value {
+        value.to_owned()
+    } else {
+        "/dashboard".to_owned()
+    }
+}
+
+fn oauth_success_url(state: &AppState, return_to: &str) -> AppResult<Url> {
+    if let Some(url) = mcp_authorize_return_url(&state.config.public_base_url, return_to) {
+        return Ok(url);
+    }
+    if return_to.starts_with("http://") || return_to.starts_with("https://") {
+        return Err(AppError::Internal(anyhow::anyhow!(
+            "invalid signed MCP authorization return URL"
+        )));
+    }
+    frontend_url(state, return_to)
+}
+
 fn safe_auth_mode(value: Option<&str>) -> &str {
     if value == Some("register") {
         "register"
@@ -181,7 +226,6 @@ fn verify_oauth_state(value: &str, secret: &str) -> Option<OAuthState> {
     let state: OAuthState = serde_json::from_slice(&payload).ok()?;
     let age = Utc::now().timestamp().checked_sub(state.issued_at)?;
     if !(0..=OAUTH_STATE_MAX_AGE_SECONDS).contains(&age)
-        || safe_return_to(Some(&state.return_to)) != state.return_to
         || !matches!(state.mode.as_str(), "login" | "register")
     {
         return None;
@@ -462,7 +506,7 @@ pub async fn get_session(
     tag = "auth",
     params(
         ("mode" = Option<String>, Query, description = "login or register"),
-        ("return_to" = Option<String>, Query, description = "Safe UI-relative path after sign-in")
+        ("return_to" = Option<String>, Query, description = "Safe UI path or MCP authorization callback")
     ),
     responses((status = 307, description = "Redirect to Google's authorization page"))
 )]
@@ -472,7 +516,7 @@ pub async fn google_start(
     Query(query): Query<GoogleStartQuery>,
 ) -> AppResult<Redirect> {
     let mode = safe_auth_mode(query.mode.as_deref()).to_string();
-    let return_to = safe_return_to(query.return_to.as_deref()).to_string();
+    let return_to = safe_auth_return_to(&state.config.public_base_url, query.return_to.as_deref());
     let (Some(client_id), Some(_)) = (
         state.config.google_client_id.as_deref(),
         state.config.google_client_secret.as_deref(),
@@ -637,7 +681,7 @@ pub async fn google_callback(
         user_id = %user.id,
         "OAuth login succeeded"
     );
-    let destination = frontend_url(&state, &oauth_state.return_to)?;
+    let destination = oauth_success_url(&state, &oauth_state.return_to)?;
     Ok(Redirect::temporary(destination.as_str()))
 }
 
@@ -648,7 +692,7 @@ pub async fn google_callback(
     tag = "auth",
     params(
         ("mode" = Option<String>, Query, description = "login or register"),
-        ("return_to" = Option<String>, Query, description = "Safe UI-relative path after sign-in")
+        ("return_to" = Option<String>, Query, description = "Safe UI path or MCP authorization callback")
     ),
     responses((status = 307, description = "Redirect to GitHub's authorization page"))
 )]
@@ -658,7 +702,7 @@ pub async fn github_start(
     Query(query): Query<GithubStartQuery>,
 ) -> AppResult<Redirect> {
     let mode = safe_auth_mode(query.mode.as_deref()).to_string();
-    let return_to = safe_return_to(query.return_to.as_deref()).to_string();
+    let return_to = safe_auth_return_to(&state.config.public_base_url, query.return_to.as_deref());
     let (Some(client_id), Some(_)) = (
         state.config.github_client_id.as_deref(),
         state.config.github_client_secret.as_deref(),
@@ -809,7 +853,7 @@ pub async fn github_callback(
         user_id = %user.id,
         "OAuth login succeeded"
     );
-    let destination = frontend_url(&state, &oauth_state.return_to)?;
+    let destination = oauth_success_url(&state, &oauth_state.return_to)?;
     Ok(Redirect::temporary(destination.as_str()))
 }
 
@@ -1242,6 +1286,37 @@ mod oauth_tests {
             "/dashboard"
         );
         assert_eq!(safe_return_to(Some("/\\attacker.example")), "/dashboard");
+    }
+
+    #[test]
+    fn allows_only_the_configured_mcp_authorization_return_url() {
+        let public_base = "https://backend.example";
+        assert_eq!(
+            safe_auth_return_to(
+                public_base,
+                Some("https://backend.example/api/mcp/oauth/authorize?state=xyz")
+            ),
+            "https://backend.example/api/mcp/oauth/authorize?state=xyz"
+        );
+        assert_eq!(
+            safe_auth_return_to(public_base, Some("/api/mcp/oauth/authorize?state=xyz")),
+            "https://backend.example/api/mcp/oauth/authorize?state=xyz"
+        );
+        assert_eq!(
+            safe_auth_return_to(
+                public_base,
+                Some("https://attacker.example/api/mcp/oauth/authorize")
+            ),
+            "/dashboard"
+        );
+        assert_eq!(
+            safe_auth_return_to(public_base, Some("https://backend.example/api/auth/logout")),
+            "/dashboard"
+        );
+        assert_eq!(
+            safe_auth_return_to(public_base, Some("/dashboard?tab=recent")),
+            "/dashboard?tab=recent"
+        );
     }
 
     #[test]

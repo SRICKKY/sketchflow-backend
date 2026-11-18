@@ -1167,7 +1167,7 @@ async fn handle_socket(
 }
 
 /// Checks operation IDs, batch limits, element types, and duplicate IDs before persistence.
-pub(super) fn validate_operation(
+pub(crate) fn validate_operation(
     client_operation_id: &str,
     batch: ElementBatch,
 ) -> AppResult<ElementBatch> {
@@ -1296,7 +1296,7 @@ fn display_presence_name(name: Option<&str>, email: &str) -> String {
 }
 
 /// Reads board elements with the revision that identifies their persisted state.
-async fn load_snapshot(state: &AppState, board_id: &str) -> AppResult<SnapshotResponse> {
+pub(crate) async fn load_snapshot(state: &AppState, board_id: &str) -> AppResult<SnapshotResponse> {
     // Older boards may not yet have a collaboration revision row.
     sqlx::query(
         r#"INSERT INTO board_collaboration_state (board_id, revision)
