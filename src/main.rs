@@ -257,11 +257,13 @@ async fn main() {
         .merge(routes::editor::router())
         .merge(routes::notifications::router())
         .merge(routes::public_links::router())
+        .with_state(state.clone())
+        .merge(routes::mcp::oauth::router(state.clone()))
+        .merge(routes::mcp::router(state.clone()))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .layer(CookieManagerLayer::new())
-        .layer(middleware::from_fn(request_logging::log_request_payload))
-        .with_state(state);
+        .layer(middleware::from_fn(request_logging::log_request_payload));
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

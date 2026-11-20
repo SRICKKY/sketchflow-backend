@@ -162,7 +162,39 @@ For end-to-end local payment testing, see
 | Uploads | `POST /api/uploads/presign`, `POST /api/uploads/{assetId}/complete`, `POST /api/uploads/{assetId}/abort`, `GET /api/uploads/{assetId}` |
 | Notifications | `GET /api/notifications`, `GET /api/notifications/unread-count`, `PATCH /api/notifications/{notificationId}`, `POST /api/notifications/read-all` |
 | Collaboration | `GET /api/boards/{boardId}/snapshot`, `GET /api/boards/{boardId}/collaboration` (WebSocket) |
+| MCP | `POST /api/mcp`, OAuth discovery, registration, authorization, token, and grant routes |
 | Invoices | `GET /billing/{invoiceId}/pdf` |
+
+### MCP canvas agents
+
+The backend exposes a remote MCP Streamable HTTP endpoint at
+`POST /api/mcp`. OAuth clients can discover its protected-resource metadata at
+`/.well-known/oauth-protected-resource/api/mcp` and authorization-server
+metadata at `/.well-known/oauth-authorization-server`. Public clients register
+at `POST /api/mcp/oauth/register`, then use authorization-code flow with PKCE
+through `/api/mcp/oauth/authorize` and `/api/mcp/oauth/token`. Set
+`PUBLIC_BASE_URL` to the externally reachable backend URL and
+`FRONTEND_BASE_URL` to the SketchFlow sign-in UI. Browser-origin requests must
+match `CORS_ALLOWED_ORIGINS`; native clients may omit `Origin`.
+For a cross-origin frontend, build the UI with
+`REACT_APP_API_BASE_URL` set to the same backend origin as `PUBLIC_BASE_URL`,
+so login can safely return to the MCP consent screen.
+
+The available tools are `list_boards`, `get_board`, `draw_shapes`,
+`draw_freehand`, `draw_connector`, `add_text`, `update_elements`, and
+`delete_elements`. Every call checks the user's current board role. Read tools
+require `boards:read`; writes additionally require the user to explicitly
+approve `boards:write` on the consent page and have editor access to that
+board. Mutations are limited to canvas elements and use the same schema,
+revision checks, persistence, and live collaboration broadcast as other
+editor operations. Pass the current `baseRevision` from `get_board` and a
+stable `clientOperationId` per mutation; reuse that ID only when retrying the
+same operation. Conflicting revisions are returned as tool errors and require
+the client to reread the board before retrying.
+
+Users can revoke active agent grants through the authenticated
+`GET /api/mcp/oauth/grants` and `DELETE /api/mcp/oauth/grants/{grantId}`
+routes. Access tokens are short-lived and are not browser session cookies.
 
 Notification routes require the signed-in `sketchflow_session` cookie and
 return private, non-cacheable responses. The list endpoint accepts
